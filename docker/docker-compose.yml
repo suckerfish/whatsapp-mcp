@@ -9,6 +9,19 @@ services:
       WHATSAPP_BRIDGE_PORT: "8080"
       WHATSAPP_BRIDGE_BIND: "0.0.0.0"
       WHATSAPP_BRIDGE_ALLOWED_HOSTS: "whatsapp-bridge:8080"
+
+    # ── Full history re-pair ──────────────────────────────────────────────────
+    # To pull complete message history from your phone:
+    #   1. Stop the stack
+    #   2. Delete /mnt/user/appdata/whatsapp-mcp/whatsapp.db
+    #   3. Uncomment the `command` line below
+    #   4. Start the stack and scan the QR code
+    #   5. Wait for history sync to finish (watch: docker logs -f whatsapp-bridge)
+    #   6. Re-comment `command` and restart normally
+    #
+    # command: ["--full-history-pair"]
+    # ─────────────────────────────────────────────────────────────────────────
+
     networks:
       - whatsapp-internal
 
