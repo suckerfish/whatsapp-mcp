@@ -1,0 +1,70 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/verygoodplugins/whatsapp-mcp.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Attempt merge
+        id: merge
+        run: |
+          if git merge upstream/main --no-edit; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Push if merged cleanly
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin main
+
+      - name: Open conflict issue
+        if: steps.merge.outputs.merged == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Upstream sync conflict — ${new Date().toISOString().slice(0, 10)}`;
+            const body = [
+              'The daily upstream sync failed due to a merge conflict.',
+              '',
+              'Resolve manually:',
+              '```',
+              'git fetch upstream main',
+              'git merge upstream/main',
+              '# fix conflicts',
+              'git push origin main',
+              '```',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['upstream-sync'],
+            });

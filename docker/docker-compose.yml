@@ -1,0 +1,37 @@
+services:
+  whatsapp-bridge:
+    image: ghcr.io/suckerfish/whatsapp-mcp-bridge:latest
+    pull_policy: always
+    restart: unless-stopped
+    volumes:
+      - /mnt/user/appdata/whatsapp-mcp:/app/store
+    environment:
+      WHATSAPP_BRIDGE_PORT: "8080"
+      WHATSAPP_BRIDGE_BIND: "0.0.0.0"
+      WHATSAPP_BRIDGE_ALLOWED_HOSTS: "whatsapp-bridge:8080"
+    networks:
+      - whatsapp-internal
+
+  whatsapp-mcp-server:
+    image: ghcr.io/suckerfish/whatsapp-mcp-server:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - /mnt/user/appdata/whatsapp-mcp:/app/store
+    environment:
+      WHATSAPP_API_URL: "http://whatsapp-bridge:8080/api"
+      WHATSAPP_BRIDGE_TOKEN: ""  # paste token from store/.bridge-token after first bridge start
+      WHATSAPP_DB_PATH: "/app/store/messages.db"
+      WHATSMEOW_DB_PATH: "/app/store/whatsapp.db"
+      MCP_TRANSPORT: "http"
+      MCP_PORT: "8765"
+    depends_on:
+      - whatsapp-bridge
+    networks:
+      - whatsapp-internal
+
+networks:
+  whatsapp-internal:
+    driver: bridge

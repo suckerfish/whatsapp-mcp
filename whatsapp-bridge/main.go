@@ -2017,9 +2017,14 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) {
 	handler := newRESTMux(client, messageStore, port, token, allowedMediaRoots)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Start the server with proper timeouts. Binds to 127.0.0.1 by default so
+	// the bridge is not reachable from the LAN. Set WHATSAPP_BRIDGE_BIND=0.0.0.0
+	// for Docker deployments where the MCP server runs in a separate container.
+	bindAddr := "127.0.0.1"
+	if b := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_BIND")); b != "" {
+		bindAddr = b
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddr, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Create server with timeouts for stability

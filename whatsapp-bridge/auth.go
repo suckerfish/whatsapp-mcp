@@ -158,10 +158,21 @@ func checkBearerToken(authHeader, expected string) bool {
 // We accept the three loopback spellings (IPv4, name, IPv6) because the
 // MCP server's choice of WHATSAPP_API_URL determines which Host header the
 // underlying HTTP client emits.
+//
+// For Docker deployments, set WHATSAPP_BRIDGE_ALLOWED_HOSTS to a
+// comma-separated list of extra Host values (e.g. "whatsapp-bridge:8080").
 func buildAllowedHosts(port int) map[string]struct{} {
-	return map[string]struct{}{
+	hosts := map[string]struct{}{
 		fmt.Sprintf("127.0.0.1:%d", port): {},
 		fmt.Sprintf("localhost:%d", port): {},
 		fmt.Sprintf("[::1]:%d", port):     {},
 	}
+	if extra := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_ALLOWED_HOSTS")); extra != "" {
+		for _, h := range strings.Split(extra, ",") {
+			if h = strings.TrimSpace(strings.ToLower(h)); h != "" {
+				hosts[h] = struct{}{}
+			}
+		}
+	}
+	return hosts
 }

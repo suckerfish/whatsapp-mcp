@@ -1,3 +1,4 @@
+import os
 import signal
 import sys
 from typing import Any
@@ -371,5 +372,9 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Initialize and run the server
-    mcp.run(transport="stdio")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport in ("http", "streamable-http"):
+        port = int(os.environ.get("MCP_PORT", "8765"))
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    else:
+        mcp.run(transport="stdio")
