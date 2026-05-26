@@ -44,12 +44,10 @@ Scan the QR code with your phone: **WhatsApp → Settings → Linked Devices →
 To pull your full message history at pair time (requires a fresh pair):
 1. Stop the stack
 2. Delete `whatsapp.db` from `/mnt/user/appdata/whatsapp-mcp/`
-3. Modify the bridge service entrypoint in `docker-compose.yml` to add the flag:
-   ```yaml
-   command: ["--full-history-pair"]
-   ```
+3. Uncomment the `command` line in `docker-compose.yml` (instructions are in the file)
 4. Start the stack and scan the QR again
-5. Remove the `command` override after pairing completes
+5. Wait for sync to finish — watch `docker logs -f whatsapp-bridge` until activity dies down
+6. Re-comment `command` and restart normally
 
 ## 2. Copy the bridge token
 
@@ -86,7 +84,17 @@ MetaMCP runs on your `ampere` VPS and is connected to Unraid via Tailscale.
 
 3. Save and verify the connection — MetaMCP should list the whatsapp tools (list_chats, list_messages, send_message, etc.).
 
-## 4. Verify everything works
+## 4. Healthchecks.io monitoring (optional)
+
+The bridge healthcheck can ping a [healthchecks.io](https://healthchecks.io) URL on every successful WhatsApp connection check (every 30s). If the bridge disconnects or crashes, pings stop and you get an alert.
+
+1. Create a new check on healthchecks.io — set period to **60s**, grace to **5 minutes**
+2. Copy the ping URL (`https://hc-ping.com/<uuid>`)
+3. Paste it into `HEALTHCHECKS_PING_URL` in your Compose stack and do `compose up -d`
+
+The check confirms the bridge container is running **and** actively connected to WhatsApp's WebSocket.
+
+## 5. Verify everything works
 
 ```bash
 # Bridge is connected to WhatsApp
