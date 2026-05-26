@@ -24,12 +24,7 @@ services:
     # ─────────────────────────────────────────────────────────────────────────
 
     healthcheck:
-      test:
-        - CMD-SHELL
-        - |
-          TOKEN=$$(cat /app/store/.bridge-token 2>/dev/null | tr -d '\n') &&
-          wget -qO- --header="Authorization: Bearer $$TOKEN" http://localhost:8080/api/health | grep -q '"connected":true' &&
-          { [ -z "$$HEALTHCHECKS_PING_URL" ] || wget -qO- "$$HEALTHCHECKS_PING_URL" > /dev/null; }
+      test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
       timeout: 10s
       retries: 3

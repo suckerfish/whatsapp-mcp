@@ -20,8 +20,8 @@ RUN apk add --no-cache ca-certificates sqlite-libs
 
 WORKDIR /app
 COPY --from=builder /whatsapp-bridge /app/whatsapp-bridge
-
-RUN mkdir -p /app/store
+COPY docker/bridge/healthcheck.sh /app/healthcheck.sh
+RUN chmod +x /app/healthcheck.sh && mkdir -p /app/store
 
 EXPOSE 8080
 
