@@ -9,6 +9,7 @@ services:
       WHATSAPP_BRIDGE_PORT: "8080"
       WHATSAPP_BRIDGE_BIND: "0.0.0.0"
       WHATSAPP_BRIDGE_ALLOWED_HOSTS: "whatsapp-bridge:8080"
+      HEALTHCHECKS_PING_URL: ""  # e.g. https://hc-ping.com/<uuid> — ping on each successful health check
 
     # ── Full history re-pair ──────────────────────────────────────────────────
     # To pull complete message history from your phone:
@@ -28,7 +29,8 @@ services:
         - |
           TOKEN=$(cat /app/store/.bridge-token 2>/dev/null | tr -d '\n') &&
           wget -qO- --header="Authorization: Bearer $TOKEN"
-          http://localhost:8080/api/health | grep -q '"connected":true'
+          http://localhost:8080/api/health | grep -q '"connected":true' &&
+          { [ -z "$HEALTHCHECKS_PING_URL" ] || wget -qO- "$HEALTHCHECKS_PING_URL" > /dev/null; }
       interval: 30s
       timeout: 10s
       retries: 3
