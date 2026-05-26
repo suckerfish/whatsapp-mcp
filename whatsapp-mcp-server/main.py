@@ -380,9 +380,7 @@ if __name__ == "__main__":
         mcp.settings.port = int(os.environ.get("MCP_PORT", "8765"))
         # Disable DNS rebinding protection — we bind to 0.0.0.0 and rely on
         # the network layer (MetaMCP / Tailscale) for access control.
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
-        )
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
         mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
