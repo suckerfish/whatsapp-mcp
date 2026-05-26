@@ -374,8 +374,15 @@ if __name__ == "__main__":
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport in ("http", "streamable-http"):
+        from mcp.server.transport_security import TransportSecuritySettings
+
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(os.environ.get("MCP_PORT", "8765"))
+        # Disable DNS rebinding protection — we bind to 0.0.0.0 and rely on
+        # the network layer (MetaMCP / Tailscale) for access control.
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
         mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")
