@@ -22,6 +22,17 @@ services:
     # command: ["--full-history-pair"]
     # ─────────────────────────────────────────────────────────────────────────
 
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          TOKEN=$(cat /app/store/.bridge-token 2>/dev/null | tr -d '\n') &&
+          wget -qO- --header="Authorization: Bearer $TOKEN"
+          http://localhost:8080/api/health | grep -q '"connected":true'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       - whatsapp-internal
 
@@ -40,6 +51,12 @@ services:
       WHATSMEOW_DB_PATH: "/app/store/whatsapp.db"
       MCP_TRANSPORT: "http"
       MCP_PORT: "8765"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(); s.connect(('localhost', 8765)); s.close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
       - whatsapp-bridge
     networks:
