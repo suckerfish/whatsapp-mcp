@@ -45,8 +45,9 @@ services:
       WHATSAPP_BRIDGE_TOKEN: ""  # paste token from store/.bridge-token after first bridge start
       WHATSAPP_DB_PATH: "/app/store/messages.db"
       WHATSMEOW_DB_PATH: "/app/store/whatsapp.db"
-      MCP_TRANSPORT: "http"
-      MCP_PORT: "8765"
+      WHATSAPP_MCP_TRANSPORT: "http"
+      WHATSAPP_MCP_HOST: "0.0.0.0"
+      WHATSAPP_MCP_PORT: "8765"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(); s.connect(('localhost', 8765)); s.close()\""]
       interval: 30s
