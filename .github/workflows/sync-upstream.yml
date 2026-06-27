@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: write
 
     steps:
       - name: Checkout fork
@@ -44,27 +43,18 @@ jobs:
         if: steps.merge.outputs.merged == 'true'
         run: git push origin main
 
-      - name: Open conflict issue
+      - name: Report conflict
         if: steps.merge.outputs.merged == 'false'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const title = `Upstream sync conflict — ${new Date().toISOString().slice(0, 10)}`;
-            const body = [
-              'The daily upstream sync failed due to a merge conflict.',
-              '',
-              'Resolve manually:',
-              '```',
-              'git fetch upstream main',
-              'git merge upstream/main',
-              '# fix conflicts',
-              'git push origin main',
-              '```',
-            ].join('\n');
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-              labels: ['upstream-sync'],
-            });
+        run: |
+          {
+            echo "### Upstream sync conflict"
+            echo "Resolve manually:"
+            echo '```'
+            echo "git fetch upstream main"
+            echo "git merge upstream/main"
+            echo "# fix conflicts"
+            echo "git push origin main"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream sync hit a merge conflict — manual resolution needed."
+          exit 1
