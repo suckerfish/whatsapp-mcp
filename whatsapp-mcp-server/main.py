@@ -5,6 +5,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_config import resolve_host, resolve_port, resolve_transport
 from whatsapp import (
     download_media as whatsapp_download_media,
 )
@@ -47,8 +48,12 @@ from whatsapp import (
 from whatsapp import (
     send_message as whatsapp_send_message,
 )
+from whatsapp import (
+    send_reaction as whatsapp_send_reaction,
+)
 
-# Initialize FastMCP server
+# Initialize FastMCP server. Env-var handling is deferred to the __main__ block
+# so importing this module never parses env vars or exits the process.
 mcp = FastMCP("whatsapp")
 
 
@@ -331,6 +336,32 @@ def send_message(
 
 
 @mcp.tool()
+def send_reaction(
+    recipient: str,
+    message_id: str,
+    emoji: str,
+    from_me: bool = False,
+    sender_jid: str = "",
+) -> dict[str, Any]:
+    """Send (or remove) a reaction to a WhatsApp message.
+
+    Args:
+        recipient: The chat JID the message belongs to (e.g., "12025551234@s.whatsapp.net"
+                   or a group JID like "123456789@g.us")
+        message_id: The ID of the message to react to
+        emoji: The reaction emoji (e.g., "👍"). Pass an empty string to remove the reaction.
+        from_me: Whether the original message was sent by the current user (default False)
+        sender_jid: JID of the original message sender — required for group messages when
+                    from_me is False so the bridge can build the correct WhatsApp key
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_send_reaction(recipient, message_id, emoji, from_me, sender_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
 def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -393,15 +424,27 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    if transport in ("http", "streamable-http"):
-        from mcp.server.transport_security import TransportSecuritySettings
+    # Resolve the transport first: host/port are only used (and validated) for the
+    # network transports, so a bad WHATSAPP_MCP_PORT can't break a stdio launch.
+    # The localhost default keeps a remote server unreachable until explicitly opened up.
+    try:
+        transport = resolve_transport(os.getenv("WHATSAPP_MCP_TRANSPORT"))
+        if transport != "stdio":
+            from mcp.server.transport_security import TransportSecuritySettings
 
-        mcp.settings.host = "0.0.0.0"
-        mcp.settings.port = int(os.environ.get("MCP_PORT", "8765"))
-        # Disable DNS rebinding protection — we bind to 0.0.0.0 and rely on
-        # the network layer (MetaMCP / Tailscale) for access control.
-        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
+            mcp.settings.host = resolve_host(os.getenv("WHATSAPP_MCP_HOST"))
+            mcp.settings.port = resolve_port(os.getenv("WHATSAPP_MCP_PORT"))
+            # Disable DNS rebinding protection — FastMCP locks allowed Host headers to
+            # localhost at construction time, which rejects requests once we bind to a
+            # non-default host (e.g. 0.0.0.0). The network layer (MetaMCP / Tailscale)
+            # handles access control instead.
+            mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+            # stdout is reserved for the protocol on stdio; log startup to stderr.
+            print(
+                f"WhatsApp MCP server listening on {mcp.settings.host}:{mcp.settings.port} via {transport}",
+                file=sys.stderr,
+            )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+
+    mcp.run(transport=transport)

@@ -3,7 +3,7 @@
 [![CI](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](https://go.dev/)
+[![Go 1.25+](https://img.shields.io/badge/go-1.25+-00ADD8.svg)](https://go.dev/)
 
 A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and send WhatsApp messages.
 
@@ -31,7 +31,7 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) package manager
 - Claude Desktop or Cursor
@@ -199,6 +199,42 @@ Inbound quoted replies are stored automatically. The `quoted_message_id` field i
 - "Message the team group saying 'Meeting at 3pm'"
 - "Reply to that message saying 'Sounds good'"
 
+#### `send_reaction`
+
+Send (or remove) an emoji reaction to a message.
+
+**Parameters:**
+
+- `recipient` (required): Chat JID the message belongs to (phone JID or group JID)
+- `message_id` (required): ID of the message to react to
+- `emoji` (required): Reaction emoji (e.g. `"👍"`). Pass an empty string `""` to remove an existing reaction.
+- `from_me` (optional, default `false`): Whether the original message was sent by the current user
+- `sender_jid` (optional): Full JID of the original message sender — required for group messages when `from_me` is `false` so the correct WhatsApp key is built
+
+Inbound reactions received from others are stored automatically as messages with `media_type = "reaction"`. The `reaction_to_message_id` field in each reaction message indicates which message was reacted to.
+
+When webhook forwarding is enabled, inbound reactions are also posted to `WEBHOOK_URL` as typed events. Reaction removals use an empty `content`/`reactionEmoji` and `reactionRemoved: true`.
+
+```json
+{
+  "eventType": "reaction",
+  "sender": "15551234567",
+  "chatJID": "15551234567@s.whatsapp.net",
+  "isFromMe": true,
+  "content": "👍",
+  "messageId": "reaction-stanza-id",
+  "mediaType": "reaction",
+  "reactionToMessageId": "target-message-id",
+  "reactionEmoji": "👍",
+  "reactionRemoved": false
+}
+```
+
+**Natural Language Examples:**
+
+- "React to that message with a thumbs up"
+- "Remove my reaction from the last message in the group chat"
+
 #### `send_file`
 
 Send a media file (image, video, document).
@@ -299,8 +335,34 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
-| `WHATSAPP_BRIDGE_TOKEN` | generated in `whatsapp-bridge/store/.bridge-token` | Bearer token required for bridge REST calls |
+| `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token required for bridge REST calls |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
+| `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
+| `WHATSAPP_MCP_HOST`    | `127.0.0.1`                              | Bind address for the `http`/`sse` transports |
+| `WHATSAPP_MCP_PORT`    | `8000`                                   | Port for the `http`/`sse` transports |
+
+### MCP transport (stdio vs http/sse)
+
+By default the server speaks MCP over **stdio**, which is what local clients
+like Claude Desktop and Cursor launch. To serve the server over the network
+instead, set `WHATSAPP_MCP_TRANSPORT`:
+
+```bash
+# Streamable HTTP (current spec transport for remote MCP), endpoint at /mcp
+WHATSAPP_MCP_TRANSPORT=http WHATSAPP_MCP_PORT=8000 uv run main.py
+
+# Legacy Server-Sent Events transport (deprecated in the MCP spec), endpoint at /sse
+WHATSAPP_MCP_TRANSPORT=sse uv run main.py
+```
+
+`http` is an alias for the spec's `streamable-http` transport and is the
+recommended choice for remote connections; `sse` is kept for older clients.
+
+> **Security:** `WHATSAPP_MCP_HOST` defaults to `127.0.0.1`, so the HTTP/SSE
+> server is reachable only from the local machine. The server has no built-in
+> authentication, and the underlying bridge can read and send WhatsApp messages
+> on your account. Only bind to a non-loopback address (e.g. `0.0.0.0`) if you
+> place an authenticating reverse proxy or tunnel in front of it.
 
 ### Bridge authentication and media paths
 
@@ -309,10 +371,11 @@ accepts only exact loopback Host headers for its configured port. This protects
 the local REST API from other local processes and browser DNS-rebinding attacks.
 
 On first start, the bridge generates a 256-bit token, writes it to
-`whatsapp-bridge/store/.bridge-token` with owner-only permissions, and prints a
-setup banner. The MCP server reads `WHATSAPP_BRIDGE_TOKEN` first, then falls
-back to that token file. For split deployments, containers, or process managers
-that do not share the repository directory, set the same
+`.bridge-token` in the active bridge store directory with owner-only
+permissions, and prints a setup banner. The MCP server reads
+`WHATSAPP_BRIDGE_TOKEN` first, then falls back to `.bridge-token` in the same
+directory as `WHATSMEOW_DB_PATH`. For split deployments, containers, or process
+managers that do not share the store directory, set the same
 `WHATSAPP_BRIDGE_TOKEN` value for both the bridge and MCP server.
 
 Outbound `media_path` values are confined to `WHATSAPP_MEDIA_ROOTS`. The default
@@ -492,6 +555,7 @@ flowchart LR
         direction TB
         SEND["/api/send"]
         DOWN["/api/download"]
+        REACT["/api/react"]
         TYPE["/api/typing"]
         HEALTH["/api/health"]
     end
@@ -598,9 +662,9 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
   `whatsapp-bridge/store/whatsapp.db` aside and re-authenticate. Keep
   `messages.db` unless you intentionally want to discard local message history.
 - **Bridge returns 401 Unauthorized**: Restart the bridge so it creates
-  `whatsapp-bridge/store/.bridge-token`, then restart the MCP server. If the MCP
-  server cannot read that file, set `WHATSAPP_BRIDGE_TOKEN` to the same value in
-  both environments.
+  `.bridge-token` next to `WHATSMEOW_DB_PATH`, then restart the MCP server. If
+  the MCP server cannot read that file, set `WHATSAPP_BRIDGE_TOKEN` to the same
+  value in both environments.
 - **Bridge returns 403 Forbidden for Host**: Use `WHATSAPP_API_URL` with
   `http://127.0.0.1:<port>/api`, `http://localhost:<port>/api`, or
   `http://[::1]:<port>/api`; custom hostnames and missing ports are rejected.
