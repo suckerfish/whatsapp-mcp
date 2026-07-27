@@ -258,6 +258,29 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
             conn.close()
 
 
+def _display_chat_name(jid: str, name: str | None) -> str | None:
+    """Resolve a chat's display name, falling back to whatsmeow's contact store.
+
+    ``chats.name`` in messages.db is a denormalized cache written when the
+    bridge first sees a chat, so it keeps whatever was known at that moment —
+    usually the bare phone number. Contacts synced from the phone afterwards
+    land in whatsapp.db and never backfill that column, which is why a chat can
+    display as "14085551234" while the address book knows it as "Jane Doe".
+
+    Only consult the contact store when the cached name is missing or is just
+    the number; a real name already in ``chats.name`` (including one the user
+    set) always wins, and the lookup is skipped entirely for groups.
+    """
+    if jid.endswith("@g.us"):
+        return name
+
+    cached = (name or "").strip()
+    if cached and not cached.lstrip("+").isdigit():
+        return name
+
+    return _resolve_name_from_whatsmeow(jid) or name
+
+
 def get_sender_name(sender_jid: str) -> str:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
@@ -670,7 +693,7 @@ def list_chats(
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_display_chat_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -805,7 +828,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_display_chat_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -927,7 +950,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
 
         chat = Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=_display_chat_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
@@ -974,7 +997,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
 
         chat = Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=_display_chat_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],

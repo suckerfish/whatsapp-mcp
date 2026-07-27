@@ -174,3 +174,95 @@ def test_get_contact_chats_returns_each_chat_once_with_last_message(messages_db)
     assert len(group_chats) == 1
     assert group_chats[0]["last_message"] == "actual chat last message"
     assert group_chats[0]["last_sender"] == "9999999999@s.whatsapp.net"
+
+
+def _make_whatsmeow_db(path):
+    """Minimal whatsapp.db with the contact store the resolver reads."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE whatsmeow_contacts (
+            our_jid TEXT,
+            their_jid TEXT,
+            first_name TEXT,
+            full_name TEXT,
+            push_name TEXT,
+            business_name TEXT
+        );
+        """
+    )
+    conn.executemany(
+        """INSERT INTO whatsmeow_contacts
+           (our_jid, their_jid, first_name, full_name, push_name, business_name)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            ("me@s.whatsapp.net", "14085551234@s.whatsapp.net", "", "Jane Doe", "Janey", ""),
+            ("me@s.whatsapp.net", "14085559999@s.whatsapp.net", "", "", "Pushy", ""),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def contacts_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "whatsapp.db"
+    _make_whatsmeow_db(str(db_path))
+    monkeypatch.setattr(whatsapp, "WHATSMEOW_DB_PATH", str(db_path))
+    return db_path
+
+
+def _add_chat(db, jid, name, ts="2024-01-16 09:00:00+00:00"):
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)", (jid, name, ts))
+    conn.commit()
+    conn.close()
+
+
+def test_numeric_chat_name_resolves_to_contact(messages_db, contacts_db):
+    """The bug: chats.name caches the bare number and never backfills from
+    the contact store, so the chat displays as digits."""
+    _add_chat(messages_db, "14085551234@s.whatsapp.net", "14085551234")
+
+    chats = whatsapp.list_chats(query="14085551234")
+    assert len(chats) == 1
+    assert chats[0]["name"] == "Jane Doe"
+
+
+def test_resolution_falls_back_to_push_name(messages_db, contacts_db):
+    _add_chat(messages_db, "14085559999@s.whatsapp.net", "14085559999")
+
+    chat = whatsapp.get_chat("14085559999@s.whatsapp.net")
+    assert chat["name"] == "Pushy"
+
+
+def test_real_cached_name_is_not_overwritten(messages_db, contacts_db):
+    """A non-numeric cached name wins even when a contact record exists."""
+    _add_chat(messages_db, "14085551234@s.whatsapp.net", "Custom Label")
+
+    chat = whatsapp.get_chat("14085551234@s.whatsapp.net")
+    assert chat["name"] == "Custom Label"
+
+
+def test_unknown_number_keeps_its_digits(messages_db, contacts_db):
+    """No contact record — the number is still the best available name."""
+    _add_chat(messages_db, "19998887777@s.whatsapp.net", "19998887777")
+
+    chat = whatsapp.get_chat("19998887777@s.whatsapp.net")
+    assert chat["name"] == "19998887777"
+
+
+def test_group_chats_skip_contact_lookup(messages_db, contacts_db):
+    _add_chat(messages_db, "12345@g.us", "12345")
+
+    chat = whatsapp.get_chat("12345@g.us")
+    assert chat["name"] == "12345"
+
+
+def test_missing_contacts_db_is_not_fatal(messages_db, tmp_path, monkeypatch):
+    """Resolver must degrade gracefully when whatsapp.db is absent."""
+    monkeypatch.setattr(whatsapp, "WHATSMEOW_DB_PATH", str(tmp_path / "nope.db"))
+    _add_chat(messages_db, "14085551234@s.whatsapp.net", "14085551234")
+
+    chat = whatsapp.get_chat("14085551234@s.whatsapp.net")
+    assert chat["name"] == "14085551234"
