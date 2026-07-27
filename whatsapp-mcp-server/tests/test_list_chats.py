@@ -38,6 +38,7 @@ def _make_messages_db(path):
             file_sha256 BLOB,
             file_enc_sha256 BLOB,
             file_length INTEGER,
+            quoted_message_id TEXT,
             PRIMARY KEY (id, chat_jid),
             FOREIGN KEY (chat_jid) REFERENCES chats(jid)
         );
@@ -266,3 +267,29 @@ def test_missing_contacts_db_is_not_fatal(messages_db, tmp_path, monkeypatch):
 
     chat = whatsapp.get_chat("14085551234@s.whatsapp.net")
     assert chat["name"] == "14085551234"
+
+
+def test_list_messages_resolves_chat_name(messages_db, contacts_db):
+    """chat_name on Message rows comes from the same stale chats.name cache
+    and must resolve too — list_messages showed the bare number while
+    sender_name was already correct."""
+    _add_chat(messages_db, "14085551234@s.whatsapp.net", "14085551234")
+    conn = sqlite3.connect(messages_db)
+    conn.execute(
+        """INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            "m-resolve",
+            "14085551234@s.whatsapp.net",
+            "14085551234",
+            "hi there",
+            "2024-01-16 09:00:00+00:00",
+            0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    out = whatsapp.list_messages(chat_jid="14085551234@s.whatsapp.net", include_context=False)
+    assert len(out) == 1
+    assert out[0]["chat_name"] == "Jane Doe"

@@ -471,7 +471,7 @@ def list_messages(
             message = Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_display_chat_name(msg[5], msg[2]),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -537,7 +537,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         target_message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
-            chat_name=msg_data[2],
+            chat_name=_display_chat_name(msg_data[5], msg_data[2]),
             content=msg_data[3],
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
@@ -566,7 +566,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                 Message(
                     timestamp=datetime.fromisoformat(msg[0]),
                     sender=msg[1],
-                    chat_name=msg[2],
+                    chat_name=_display_chat_name(msg[5], msg[2]),
                     content=msg[3],
                     is_from_me=msg[4],
                     chat_jid=msg[5],
@@ -596,7 +596,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                 Message(
                     timestamp=datetime.fromisoformat(msg[0]),
                     sender=msg[1],
-                    chat_name=msg[2],
+                    chat_name=_display_chat_name(msg[5], msg[2]),
                     content=msg[3],
                     is_from_me=msg[4],
                     chat_jid=msg[5],
@@ -889,7 +889,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
         message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
-            chat_name=msg_data[2],
+            chat_name=_display_chat_name(msg_data[5], msg_data[2]),
             content=msg_data[3],
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
