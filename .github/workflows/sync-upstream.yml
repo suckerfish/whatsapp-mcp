@@ -16,10 +16,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # SYNC_TOKEN is a PAT with `repo` + `workflow` scope. The default
-          # GITHUB_TOKEN cannot push commits that touch .github/workflows/,
-          # so upstream workflow changes fail the push without it.
-          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN cannot push commits that touch .github/workflows/.
+          # Those syncs are done manually — see the "Push if merged cleanly" step.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -52,16 +51,14 @@ jobs:
           cat push.log
           if grep -q "without \`workflows\` permission" push.log; then
             {
-              echo "### Upstream sync blocked"
+              echo "### Upstream sync needs a manual push"
               echo "Upstream changed a file in \`.github/workflows/\`."
-              echo "The default \`GITHUB_TOKEN\` cannot push workflow changes."
-              echo "Add a PAT with \`repo\` + \`workflow\` scope as the \`SYNC_TOKEN\` secret,"
-              echo "or sync manually:"
+              echo "\`GITHUB_TOKEN\` cannot push workflow changes. Sync locally:"
               echo '```'
               echo "git fetch upstream main && git merge upstream/main && git push origin main"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Push rejected: workflow files changed and SYNC_TOKEN is not set."
+            echo "::error::Push rejected: upstream changed workflow files — sync manually."
           fi
           exit 1
 
