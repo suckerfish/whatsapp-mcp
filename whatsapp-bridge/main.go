@@ -67,6 +67,13 @@ func getEnvBool(key string, def bool) bool {
 	}
 }
 
+// resolveDeviceName returns the operator-configured linked-device label from
+// WHATSAPP_DEVICE_NAME, trimmed of surrounding whitespace. An empty or unset
+// value returns "", which callers treat as "keep the whatsmeow default".
+func resolveDeviceName() string {
+	return strings.TrimSpace(os.Getenv("WHATSAPP_DEVICE_NAME"))
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -942,6 +949,10 @@ type SendMessageRequest struct {
 	QuotedMessageID string `json:"quoted_message_id,omitempty"`
 	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
 	QuotedContent   string `json:"quoted_content,omitempty"`
+	// Mentions lists users to @-mention (phone numbers or JIDs). The message
+	// text must contain a matching "@<number>" token for each entry, or the
+	// mention won't render on recipients' devices.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // ReactRequest is the request body for the /api/react endpoint.
@@ -1161,11 +1172,41 @@ func resolveRecipientJID(client *whatsmeow.Client, recipient string) (types.JID,
 	return recipientJID, nil
 }
 
+// resolveMentionJIDs maps mention entries (phone numbers or JIDs) to the JID
+// strings WhatsApp expects in ContextInfo.MentionedJID. Phone-number entries
+// contribute both the phone JID and, when known, its LID form so the mention
+// renders regardless of the group's addressing mode.
+func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
+	var resolved []string
+	for _, mention := range mentions {
+		var jid types.JID
+		if strings.Contains(mention, "@") {
+			parsed, err := types.ParseJID(mention)
+			if err != nil {
+				fmt.Printf("Warning: skipping unparseable mention %q: %v\n", mention, err)
+				continue
+			}
+			jid = parsed
+		} else {
+			jid = types.JID{User: mention, Server: types.DefaultUserServer}
+		}
+		resolved = append(resolved, jid.String())
+		if jid.Server == types.DefaultUserServer {
+			if lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !lid.IsEmpty() {
+				resolved = append(resolved, lid.String())
+			}
+		}
+	}
+	return resolved
+}
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
+
+	mentionedJIDs := resolveMentionJIDs(client, mentions)
 
 	var settingsLookupJID types.JID
 	var err error
@@ -1281,22 +1322,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		}
-	} else if quotedMsgID != "" {
-		// Quoted reply: use ExtendedTextMessage so we can attach ContextInfo.
-		// Only text quoting is supported; quoting media messages is not exposed
-		// because the quoted preview on the recipient's device requires the
-		// original media's key/URL, which is not available to the API caller.
-		ctx := &waProto.ContextInfo{
-			StanzaID:      proto.String(quotedMsgID),
-			Participant:   proto.String(quotedSenderJID),
-			QuotedMessage: &waProto.Message{Conversation: proto.String(quotedContent)},
+	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
+		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
+		// attach ContextInfo. Only text quoting is supported; quoting media
+		// messages is not exposed because the quoted preview on the
+		// recipient's device requires the original media's key/URL, which is
+		// not available to the API caller.
+		ctx := &waProto.ContextInfo{}
+		if quotedMsgID != "" {
+			ctx.StanzaID = proto.String(quotedMsgID)
+			ctx.Participant = proto.String(quotedSenderJID)
+			ctx.QuotedMessage = &waProto.Message{Conversation: proto.String(quotedContent)}
 		}
+		ctx.MentionedJID = mentionedJIDs
 		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
 			Text:        proto.String(message),
 			ContextInfo: ctx,
 		}
 	} else {
 		msg.Conversation = proto.String(message)
+	}
+
+	// Mentions in media captions live on the media message's own ContextInfo.
+	if len(mentionedJIDs) > 0 {
+		switch {
+		case msg.ImageMessage != nil:
+			msg.ImageMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		case msg.VideoMessage != nil:
+			msg.VideoMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		case msg.DocumentMessage != nil:
+			msg.DocumentMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		}
 	}
 
 	// Normalize @lid recipients to phone JID before the lookup. Chats are
@@ -2064,6 +2120,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	}
 	mux := http.NewServeMux()
 
+	// On-demand history sync endpoint (see history_ondemand.go)
+	registerHistoryEndpoint(mux, auth, client, messageStore)
+
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2131,7 +2190,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2435,6 +2494,21 @@ func main() {
 			StorageQuotaMb:      proto.Uint32(102400),
 		}
 		logger.Infof("--full-history-pair enabled: requesting full history (days=3650, sizeMb=102400)")
+	}
+
+	// Set the linked-device label shown in WhatsApp's "Linked Devices" list.
+	// whatsmeow's built-in default is the literal string "whatsmeow", which is
+	// opaque to end users who then see an unfamiliar name attached to their
+	// account. WHATSAPP_DEVICE_NAME lets an operator show a recognisable label
+	// (e.g. a product or company name) instead. Empty/unset keeps the whatsmeow
+	// default. This only takes effect at pair time — an already-paired session
+	// (whatsapp.db present) keeps the name captured when the QR was scanned; to
+	// change it, re-pair. The platform icon (DeviceProps.PlatformType) is left
+	// at whatsmeow's default on purpose: this is a labelling convenience, not a
+	// way to impersonate an official WhatsApp client.
+	if name := resolveDeviceName(); name != "" {
+		store.DeviceProps.Os = proto.String(name)
+		logger.Infof("Linked-device name set to %q (WHATSAPP_DEVICE_NAME)", name)
 	}
 
 	// Create client instance
