@@ -87,6 +87,7 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			jid TEXT PRIMARY KEY,
 			name TEXT,
 			last_message_time TIMESTAMP,
+			last_read_time TIMESTAMP,
 			ephemeral_expiration INTEGER NOT NULL DEFAULT 0,
 			ephemeral_setting_timestamp INTEGER NOT NULL DEFAULT 0
 		);
@@ -344,6 +345,69 @@ func TestUpdateChatEphemeralSettings_IgnoresOlderTimestamp(t *testing.T) {
 	}
 }
 
+// TestMarkChatRead_AdvancesButNeverRegresses locks the monotonic merge: a
+// read marker is set when absent, advances on a newer read, and is never
+// moved backwards by an older read (out-of-order receipts / history-sync
+// backfill must not un-read a chat).
+func TestMarkChatRead_AdvancesButNeverRegresses(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	early := time.Unix(1710000000, 0)
+	late := time.Unix(1710009999, 0)
+
+	// sets when absent (INSERT path, no prior chat row)
+	if err := ms.MarkChatRead(chatJID, early); err != nil {
+		t.Fatalf("initial mark: %v", err)
+	}
+	got1, ok := queryChatLastReadTime(ms, chatJID)
+	if !ok || got1 == "" {
+		t.Fatalf("expected last_read_time to be set, got %q ok=%v", got1, ok)
+	}
+
+	// advances on a newer read
+	if err := ms.MarkChatRead(chatJID, late); err != nil {
+		t.Fatalf("advance mark: %v", err)
+	}
+	got2, _ := queryChatLastReadTime(ms, chatJID)
+	if got2 == got1 {
+		t.Fatalf("expected last_read_time to advance from %q, still %q", got1, got2)
+	}
+
+	// does NOT regress on an older read
+	if err := ms.MarkChatRead(chatJID, early); err != nil {
+		t.Fatalf("regress mark: %v", err)
+	}
+	got3, _ := queryChatLastReadTime(ms, chatJID)
+	if got3 != got2 {
+		t.Fatalf("expected no regress from %q, got %q", got2, got3)
+	}
+}
+
+// TestIsSelfReadReceipt covers the classification used by the Receipt handler:
+// a read is "ours" when it's a DM read-self, or a group read whose participant
+// is us (IsFromMe) — but never another user reading our outgoing message.
+func TestIsSelfReadReceipt(t *testing.T) {
+	cases := []struct {
+		name   string
+		typ    types.ReceiptType
+		fromMe bool
+		want   bool
+	}{
+		{"dm read-self", types.ReceiptTypeReadSelf, false, true},
+		{"group read by us", types.ReceiptTypeRead, true, true},
+		{"other user read our message", types.ReceiptTypeRead, false, false},
+		{"delivered", types.ReceiptTypeDelivered, false, false},
+		{"sender", types.ReceiptTypeSender, false, false},
+	}
+	for _, c := range cases {
+		r := &events.Receipt{Type: c.typ}
+		r.IsFromMe = c.fromMe
+		if got := isSelfReadReceipt(r); got != c.want {
+			t.Errorf("%s: isSelfReadReceipt=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // TestExtractChatEphemeralFromMessage covers every concrete sub-message type
 // that carries ContextInfo. Each regular message in an ephemeral chat stamps
 // ContextInfo.Expiration / EphemeralSettingTimestamp; the bridge backfills
@@ -520,6 +584,14 @@ func queryChat(ms *MessageStore, jid string) (name string, found bool) {
 func queryChatLastMessageTime(ms *MessageStore, jid string) (lastMessageTime string, found bool) {
 	err := ms.db.QueryRow("SELECT last_message_time FROM chats WHERE jid = ?", jid).Scan(&lastMessageTime)
 	return lastMessageTime, err == nil
+}
+
+// queryChatLastReadTime returns the last_read_time for a chat JID as stored
+// text (NULL becomes the empty string), plus whether the row exists.
+func queryChatLastReadTime(ms *MessageStore, jid string) (lastReadTime string, found bool) {
+	var lr sql.NullString
+	err := ms.db.QueryRow("SELECT last_read_time FROM chats WHERE jid = ?", jid).Scan(&lr)
+	return lr.String, err == nil
 }
 
 // queryMessageCount returns the number of messages stored under a chat JID.
@@ -1037,9 +1109,9 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 	phoneJID := "222@s.whatsapp.net"
 
 	_, err = ms.db.Exec(`
-		INSERT INTO chats (jid, name, last_message_time) VALUES
-			(?, 'Legacy LID Name', '2026-03-01T10:00:00Z'),
-			(?, '', '2026-03-01T09:00:00Z');
+		INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES
+			(?, 'Legacy LID Name', '2026-03-01T10:00:00Z', '2026-03-01T09:30:00Z'),
+			(?, '', '2026-03-01T09:00:00Z', '2026-03-01T08:00:00Z');
 
 		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) VALUES
 			('dup', ?, 'alice', 'lid duplicate', '2026-03-01T10:00:00Z', 0, '', '', '', NULL, NULL, NULL, 0),
@@ -1080,6 +1152,14 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 	}
 	if phoneTime != "2026-03-01T10:00:00Z" {
 		t.Fatalf("expected phone chat last_message_time to be the latest (from LID chat), got %q", phoneTime)
+	}
+
+	phoneRead, readFound := queryChatLastReadTime(ms, phoneJID)
+	if !readFound || phoneRead == "" {
+		t.Fatalf("expected phone chat last_read_time to be preserved, got %q found=%v", phoneRead, readFound)
+	}
+	if phoneRead != "2026-03-01T09:30:00Z" {
+		t.Fatalf("expected last_read_time merged to later LID marker, got %q", phoneRead)
 	}
 
 	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, logger); err != nil {
@@ -1479,6 +1559,66 @@ func TestHandleMessage_ImageWithCaption_WebhookForwarded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
+// TestHandleMessage_WebhookDisabledDownloadsImageAsynchronously ensures the
+// webhook opt-out does not make incoming image processing wait on a download
+// solely used for the vision webhook payload.
+func TestHandleMessage_WebhookDisabledDownloadsImageAsynchronously(t *testing.T) {
+	t.Setenv("WEBHOOK_ENABLED", "false")
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	msg := buildImageMessage(phonePN, phonePN, false, "")
+	msg.Message.ImageMessage.URL = proto.String("https://example.invalid/image")
+	msg.Message.ImageMessage.MediaKey = []byte("test-media-key")
+
+	originalDownload := downloadMediaForMessage
+	downloadStarted := make(chan struct{})
+	releaseDownload := make(chan struct{})
+	downloadMediaForMessage = func(_ *whatsmeow.Client, _ *MessageStore, _ string, _ string) (bool, string, string, string, error) {
+		close(downloadStarted)
+		<-releaseDownload
+		return false, "", "", "", nil
+	}
+	t.Cleanup(func() {
+		downloadMediaForMessage = originalDownload
+		select {
+		case <-releaseDownload:
+		default:
+			close(releaseDownload)
+		}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		handleMessage(client, ms, msg, logger)
+		close(done)
+	}()
+
+	select {
+	case <-downloadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for asynchronous media download")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message handling waited for media download while webhook was disabled")
+	}
+}
+
+func TestWebhookStartupMessage(t *testing.T) {
+	t.Setenv("WEBHOOK_ENABLED", "false")
+	if got, want := webhookStartupMessage(true), "WEBHOOK_ENABLED=false: outbound webhooks disabled"; got != want {
+		t.Errorf("disabled startup message = %q, want %q", got, want)
+	}
+
+	t.Setenv("WEBHOOK_ENABLED", "true")
+	if got, want := webhookStartupMessage(true), "FORWARD_SELF enabled: forwarding self messages to webhook"; got != want {
+		t.Errorf("enabled startup message = %q, want %q", got, want)
 	}
 }
 
@@ -2202,6 +2342,185 @@ func TestReactHandler_NoAuth_Returns401(t *testing.T) {
 
 	if resp.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+func TestMarkReadHandler_InvalidRequests_Return400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty body", `{}`},
+		{"missing message_ids", `{"chat_jid":"15551234567@s.whatsapp.net"}`},
+		{"missing chat_jid", `{"message_ids":["3AABCDEF01234567"]}`},
+		{"empty message_id", `{"message_ids":["3AABCDEF01234567",""],"chat_jid":"15551234567@s.whatsapp.net"}`},
+		{"invalid chat_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"@s.whatsapp.net"}`},
+		{"invalid sender_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net","sender_jid":"@s.whatsapp.net"}`},
+		{"group missing sender_jid", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"120363012345678901@g.us"}`},
+		{"invalid timestamp", `{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net","timestamp":"yesterday"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+
+			handler.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusBadRequest {
+				t.Errorf("body=%q: expected 400, got %d", tc.body, resp.Code)
+			}
+		})
+	}
+}
+
+func TestMarkReadHandler_Disconnected_Returns503(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	ms := newTestMessageStore(t)
+	chatJID := "120363012345678901@g.us"
+	sender := "15551234567"
+	msgID := "3AABCDEF01234567"
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, 'hi', ?, 0)`,
+		msgID, chatJID, sender, time.Unix(1710000000, 0),
+	); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), ms, 8080, token, nil)
+
+	body := `{"message_ids":["3AABCDEF01234567"],"chat_jid":"120363012345678901@g.us","sender_jid":"15551234567","timestamp":"2026-08-11T18:30:00Z"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for disconnected client, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestMarkReadHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read",
+		strings.NewReader(`{"message_ids":["3AABCDEF01234567"],"chat_jid":"15551234567@s.whatsapp.net"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+// TestResolveRecipientJID_ForMarkReadTargets locks the PN -> LID rewrite used
+// by /api/mark-read: MCP returns phone-form JIDs from messages.db, but
+// MarkRead must address migrated DMs (and group participants) by LID.
+func TestResolveRecipientJID_ForMarkReadTargets(t *testing.T) {
+	phoneChat := types.NewJID("15551234567", types.DefaultUserServer)
+	lidChat := types.NewJID("999888777666555", types.HiddenUserServer)
+	phoneSender := types.NewJID("15557654321", types.DefaultUserServer)
+	lidSender := types.NewJID("111222333444555", types.HiddenUserServer)
+	group := types.NewJID("120363012345678901", types.GroupServer)
+
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{
+			phoneChat:   lidChat,
+			phoneSender: lidSender,
+		},
+	})
+
+	gotChat, err := resolveRecipientJID(client, phoneChat.String())
+	if err != nil {
+		t.Fatalf("chat resolve: %v", err)
+	}
+	if gotChat != lidChat {
+		t.Fatalf("expected chat LID %s, got %s", lidChat, gotChat)
+	}
+
+	gotSender, err := resolveRecipientJID(client, phoneSender.User)
+	if err != nil {
+		t.Fatalf("sender resolve: %v", err)
+	}
+	if gotSender != lidSender {
+		t.Fatalf("expected sender LID %s, got %s", lidSender, gotSender)
+	}
+
+	gotGroup, err := resolveRecipientJID(client, group.String())
+	if err != nil {
+		t.Fatalf("group resolve: %v", err)
+	}
+	if gotGroup != group {
+		t.Fatalf("expected group JID unchanged, got %s", gotGroup)
+	}
+}
+
+func TestValidateInboundMarkRead(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	group := "120363012345678901@g.us"
+	if _, err := ms.db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES
+			('in-dm', ?, '15551234567', 'hi', ?, 0),
+			('out-dm', ?, '15559876543', 'yo', ?, 1),
+			('in-group', ?, '15557654321', 'hi', ?, 0);
+	`, chat, time.Unix(1710000000, 0), chat, time.Unix(1710000001, 0), group, time.Unix(1710000002, 0)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"in-dm"}); err != nil {
+		t.Fatalf("DM validate: %v", err)
+	}
+	if err := ms.ValidateInboundMarkRead(group, "15557654321@s.whatsapp.net", []string{"in-group"}); err != nil {
+		t.Fatalf("group validate: %v", err)
+	}
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"missing"}); err == nil {
+		t.Fatal("expected missing message error")
+	}
+	if err := ms.ValidateInboundMarkRead(chat, "", []string{"out-dm"}); err == nil {
+		t.Fatal("expected outbound message error")
+	}
+	if err := ms.ValidateInboundMarkRead(group, "15551234567", []string{"in-group"}); err == nil {
+		t.Fatal("expected sender mismatch error")
+	}
+}
+
+func TestMaxMessageTimestamp(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	early := time.Unix(1710000000, 0).UTC()
+	late := time.Unix(1710009999, 0).UTC()
+	if _, err := ms.db.Exec(`
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES
+			('a', ?, '15551234567', 'early', ?, 0),
+			('b', ?, '15551234567', 'late', ?, 0);
+	`, chat, early, chat, late); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, ok, err := ms.MaxMessageTimestamp(chat, []string{"a", "b"})
+	if err != nil || !ok {
+		t.Fatalf("MaxMessageTimestamp: ok=%v err=%v", ok, err)
+	}
+	if !got.Equal(late) {
+		t.Fatalf("expected %v, got %v", late, got)
+	}
+	_, ok, err = ms.MaxMessageTimestamp(chat, []string{"missing"})
+	if err != nil {
+		t.Fatalf("missing ids: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false for missing ids")
 	}
 }
 

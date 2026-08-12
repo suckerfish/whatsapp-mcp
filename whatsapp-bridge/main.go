@@ -205,6 +205,9 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "chats", "ephemeral_setting_timestamp", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("failed to ensure chats.ephemeral_setting_timestamp column: %w", err)
 	}
+	if err := ensureColumn(db, "chats", "last_read_time", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("failed to ensure chats.last_read_time column: %w", err)
+	}
 	if err := ensureColumn(db, "messages", "deleted_at", "TIMESTAMP"); err != nil {
 		return fmt.Errorf("failed to ensure messages.deleted_at column: %w", err)
 	}
@@ -336,7 +339,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 					FROM messages msg
 					WHERE msg.chat_jid = m.lid_jid
 				)
-			) AS source_last_message_time
+			) AS source_last_message_time,
+			c.last_read_time AS source_last_read_time
 		FROM tmp_lid_to_phone m
 		LEFT JOIN chats c ON c.jid = m.lid_jid;
 	`); err != nil {
@@ -361,7 +365,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 				),
 				substr(c.phone_jid, 1, instr(c.phone_jid, '@') - 1)
 			) AS source_name,
-			MAX(c.source_last_message_time) AS source_last_message_time
+			MAX(c.source_last_message_time) AS source_last_message_time,
+			MAX(c.source_last_read_time) AS source_last_read_time
 		FROM tmp_lid_chat_candidates c
 		GROUP BY c.phone_jid;
 	`); err != nil {
@@ -369,8 +374,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 
 	if _, err := tx.Exec(`
-		INSERT OR IGNORE INTO chats (jid, name, last_message_time)
-		SELECT phone_jid, source_name, source_last_message_time
+		INSERT OR IGNORE INTO chats (jid, name, last_message_time, last_read_time)
+		SELECT phone_jid, source_name, source_last_message_time, source_last_read_time
 		FROM tmp_lid_chat_meta;
 	`); err != nil {
 		return fmt.Errorf("failed to upsert destination chat rows: %w", err)
@@ -408,6 +413,28 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 					WHERE m.phone_jid = chats.jid
 				)
 				ELSE last_message_time
+			END,
+			last_read_time = CASE
+				WHEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				) IS NULL THEN last_read_time
+				WHEN last_read_time IS NULL THEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				)
+				WHEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				) > last_read_time THEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				)
+				ELSE last_read_time
 			END
 		WHERE jid IN (SELECT phone_jid FROM tmp_lid_chat_meta);
 	`); err != nil {
@@ -652,6 +679,27 @@ func (store *MessageStore) UpdateChatEphemeralSettings(jid string, expiration ui
 	return err
 }
 
+// MarkChatRead records that we read the chat up to readAt. The marker merges
+// monotonically — out-of-order receipts and history-sync backfill can never
+// move it backwards and un-read a chat. Like UpdateChatEphemeralSettings it
+// inserts only its own column, leaving name/last_message_time NULL so a receipt
+// arriving before any StoreChat call doesn't fabricate placeholder metadata.
+func (store *MessageStore) MarkChatRead(jid string, readAt time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, last_read_time)
+		VALUES (?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			last_read_time = CASE
+				WHEN chats.last_read_time IS NULL THEN excluded.last_read_time
+				WHEN excluded.last_read_time IS NULL THEN chats.last_read_time
+				WHEN excluded.last_read_time > chats.last_read_time THEN excluded.last_read_time
+				ELSE chats.last_read_time
+			END`,
+		jid, readAt,
+	)
+	return err
+}
+
 func (store *MessageStore) GetChatEphemeralSettings(jid string) (ChatEphemeralSettings, error) {
 	var settings ChatEphemeralSettings
 	err := store.db.QueryRow(
@@ -680,6 +728,84 @@ func (store *MessageStore) GetMessageIsFromMe(id, chatJID string) (*bool, error)
 		return nil, err
 	}
 	return &isFromMe, nil
+}
+
+// bareSenderUser normalizes a phone/LID or full JID to the bare user part
+// stored in messages.sender.
+func bareSenderUser(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// ValidateInboundMarkRead checks that every message ID exists in chatJID, is
+// inbound, and belongs to the expected sender before we send a read receipt.
+// senderHint may be bare or a full JID; when empty (DM), the chat user is used.
+func (store *MessageStore) ValidateInboundMarkRead(chatJID, senderHint string, ids []string) error {
+	expected := bareSenderUser(senderHint)
+	if expected == "" {
+		if jid, err := types.ParseJID(chatJID); err == nil {
+			expected = jid.User
+		}
+	}
+	if expected == "" {
+		return fmt.Errorf("could not determine expected sender for chat %q", chatJID)
+	}
+
+	for _, id := range ids {
+		var sender string
+		var isFromMe bool
+		err := store.db.QueryRow(
+			`SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?`,
+			id, chatJID,
+		).Scan(&sender, &isFromMe)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("message %q not found in chat %q", id, chatJID)
+		}
+		if err != nil {
+			return err
+		}
+		if isFromMe {
+			return fmt.Errorf("message %q is outbound; only inbound messages can be marked read", id)
+		}
+		if bareSenderUser(sender) != expected {
+			return fmt.Errorf("message %q sender %q does not match %q", id, sender, expected)
+		}
+	}
+	return nil
+}
+
+// MaxMessageTimestamp returns the latest stored timestamp among the given
+// message IDs in chatJID. ok is false when none of the IDs are present.
+func (store *MessageStore) MaxMessageTimestamp(chatJID string, ids []string) (time.Time, bool, error) {
+	if len(ids) == 0 {
+		return time.Time{}, false, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, 1+len(ids))
+	args = append(args, chatJID)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	var raw any
+	err := store.db.QueryRow(
+		`SELECT MAX(timestamp) FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	).Scan(&raw)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if raw == nil {
+		return time.Time{}, false, nil
+	}
+	ts := anchorTime(raw)
+	if ts.IsZero() {
+		return time.Time{}, false, fmt.Errorf("unparseable message timestamp %v", raw)
+	}
+	return ts, true, nil
 }
 
 // Store a message in the database
@@ -953,6 +1079,14 @@ type SendMessageRequest struct {
 	// text must contain a matching "@<number>" token for each entry, or the
 	// mention won't render on recipients' devices.
 	Mentions []string `json:"mentions,omitempty"`
+}
+
+// MarkReadRequest is the request body for the /api/mark-read endpoint.
+type MarkReadRequest struct {
+	MessageIDs []string `json:"message_ids"`
+	ChatJID    string   `json:"chat_jid"`
+	SenderJID  string   `json:"sender_jid,omitempty"`
+	Timestamp  string   `json:"timestamp,omitempty"`
 }
 
 // ReactRequest is the request body for the /api/react endpoint.
@@ -1587,6 +1721,15 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 	return chat
 }
 
+// isSelfReadReceipt reports whether a receipt means WE read the chat (on this
+// or another device), as opposed to another user reading our outgoing message.
+// A DM self-read arrives as read-self; a group self-read arrives as a plain
+// read whose participant is us (IsFromMe). See types.ReceiptType docs.
+func isSelfReadReceipt(receipt *events.Receipt) bool {
+	return receipt.Type == types.ReceiptTypeReadSelf ||
+		(receipt.Type == types.ReceiptTypeRead && receipt.IsFromMe)
+}
+
 // resolveUserJID resolves a single user JID (sender or participant) to its
 // phone-based equivalent. Unlike resolveLIDChat it takes a single hint alt
 // JID (either SenderAlt for the peer in a DM or the user's own phone JID
@@ -1803,14 +1946,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	// For image messages, download media synchronously so we can include the base64
-	// payload in the webhook. Other media types (video, audio, document) are still
-	// downloaded asynchronously since they are not passed to the AI vision pipeline.
+	// Avoid webhook-only image work when no webhook will receive the message. Media
+	// still downloads asynchronously in that case so it remains available to MCP
+	// tools, but message handling never blocks on a disabled outbound webhook.
+	shouldForward := webhooksEnabled() && (forwardSelfMessages || !msg.Info.IsFromMe)
+
+	// For image messages that will be forwarded, download media synchronously so we
+	// can include the base64 payload in the webhook. Other media types (and images
+	// when webhook forwarding is disabled) download asynchronously for caching.
 	var imageDownloadPath string
 	var imageMimeType string
-	if mediaType == "image" && url != "" && len(mediaKey) > 0 {
+	if mediaType == "image" && url != "" && len(mediaKey) > 0 && shouldForward {
 		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
-		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+		success, _, _, dlPath, dlErr := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 		if success && dlErr == nil {
 			imageDownloadPath = dlPath
 			// Detect MIME type by sniffing the actual file bytes rather than
@@ -1830,14 +1978,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			logger.Warnf("❌ Image download failed: %v", dlErr)
 			// Fall back to async download so media is cached for future MCP tool calls
 			go func() {
-				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+				_, _, _, _, _ = downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && mediaType != "image" && url != "" && len(mediaKey) > 0 {
-		// Non-image media: async download for caching only (not sent to vision pipeline)
+	} else if mediaType != "" && url != "" && len(mediaKey) > 0 {
+		// Media that is not included in a webhook payload: async download for caching.
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		go func() {
-			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+			success, _, _, downloadPath, err := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			if success && err == nil {
 				logger.Infof("✅ Auto-downloaded media: %s", downloadPath)
 			} else {
@@ -1850,7 +1998,6 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Forward self-messages when FORWARD_SELF=true.
 	// Always forward image messages (even without a text caption) so the AI vision
 	// pipeline can analyse the image content.
-	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
 	hasText := content != ""
 	hasImage := mediaType == "image"
 
@@ -2087,6 +2234,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
+// downloadMediaForMessage allows message-handling tests to verify whether a
+// download blocks event processing without changing production behavior.
+var downloadMediaForMessage = downloadMedia
+
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
 	// The direct path is typically in the URL, we need to extract it
@@ -2205,6 +2356,116 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			Success: success,
 			Message: message,
 		})
+	}))
+
+	// Handler for explicitly sending read receipts for selected messages.
+	mux.HandleFunc("/api/mark-read", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			http.Error(w, "chat_jid and message_ids are required", http.StatusBadRequest)
+			return
+		}
+
+		messageIDs := make([]types.MessageID, len(req.MessageIDs))
+		for i, id := range req.MessageIDs {
+			if strings.TrimSpace(id) == "" {
+				http.Error(w, "message_ids must not contain empty values", http.StatusBadRequest)
+				return
+			}
+			messageIDs[i] = types.MessageID(id)
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil || chatJID.User == "" || chatJID.Server == "" {
+			http.Error(w, "Invalid chat_jid", http.StatusBadRequest)
+			return
+		}
+
+		senderJID := types.EmptyJID
+		if req.SenderJID != "" {
+			if strings.Contains(req.SenderJID, "@") {
+				senderJID, err = types.ParseJID(req.SenderJID)
+			} else {
+				senderJID = types.NewJID(strings.TrimSpace(req.SenderJID), types.DefaultUserServer)
+			}
+			if err != nil || senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		} else if chatJID.Server == types.GroupServer {
+			http.Error(w, "sender_jid is required for group read receipts", http.StatusBadRequest)
+			return
+		}
+
+		readAt := time.Now()
+		if req.Timestamp != "" {
+			readAt, err = time.Parse(time.RFC3339, req.Timestamp)
+			if err != nil {
+				http.Error(w, "timestamp must be RFC 3339", http.StatusBadRequest)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "WhatsApp client is not connected. Please wait for reconnection.",
+			})
+			return
+		}
+
+		// Validate against the storage (phone-form) chat JID before any
+		// external side effect. LID rewrite happens only for the receipt.
+		if err := messageStore.ValidateInboundMarkRead(req.ChatJID, req.SenderJID, req.MessageIDs); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// MCP storage normalizes chats/senders to phone JIDs; MarkRead routes
+		// the receipt `to`/`participant` as given, so resolve PN -> LID the
+		// same way sendWhatsAppMessage does or migrated contacts silently fail.
+		chatJID, err = resolveRecipientJID(client, req.ChatJID)
+		if err != nil || chatJID.User == "" || chatJID.Server == "" {
+			http.Error(w, "Invalid chat_jid", http.StatusBadRequest)
+			return
+		}
+		if req.SenderJID != "" {
+			senderJID, err = resolveRecipientJID(client, req.SenderJID)
+			if err != nil || senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		}
+
+		if err := client.MarkRead(context.Background(), messageIDs, readAt, chatJID, senderJID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+
+		// Advance the local read marker immediately so list_chats unread
+		// clears without waiting for the self-read receipt round-trip.
+		localReadAt := readAt
+		if ts, ok, tsErr := messageStore.MaxMessageTimestamp(req.ChatJID, req.MessageIDs); tsErr == nil && ok {
+			localReadAt = ts
+		}
+		if err := messageStore.MarkChatRead(req.ChatJID, localReadAt); err != nil {
+			// Receipt already sent; log but still report success to the caller.
+			fmt.Printf("Warning: failed to persist local read marker for %s: %v\n", req.ChatJID, err)
+		}
+
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Messages marked as read"})
 	}))
 
 	// Handler for sending (or removing) emoji reactions
@@ -2431,6 +2692,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+func webhookStartupMessage(forwardSelf bool) string {
+	if !webhooksEnabled() {
+		return "WEBHOOK_ENABLED=false: outbound webhooks disabled"
+	}
+	if forwardSelf {
+		return "FORWARD_SELF enabled: forwarding self messages to webhook"
+	}
+	return "FORWARD_SELF disabled: self messages will NOT be forwarded"
+}
+
 func main() {
 	flag.Parse()
 
@@ -2438,11 +2709,7 @@ func main() {
 	logger := waLog.Stdout("Client", "DEBUG", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	if forwardSelfMessages {
-		logger.Infof("FORWARD_SELF enabled: forwarding self messages to webhook")
-	} else {
-		logger.Infof("FORWARD_SELF disabled: self messages will NOT be forwarded")
-	}
+	logger.Infof("%s", webhookStartupMessage(forwardSelfMessages))
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -2595,6 +2862,29 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Receipt:
+			// Persist read state so consumers can distinguish genuine unread
+			// from "latest message is inbound". Only our own reads count.
+			if isSelfReadReceipt(v) {
+				chatJID := resolveLIDChat(client, v.Chat, v.SenderAlt, v.RecipientAlt, v.IsFromMe).String()
+				// Prefer the acknowledged messages' timestamps over the
+				// receipt event time so out-of-order delivery cannot advance
+				// the marker past an unread message.
+				readAt := v.Timestamp
+				ids := make([]string, len(v.MessageIDs))
+				for i, id := range v.MessageIDs {
+					ids[i] = string(id)
+				}
+				if ts, ok, err := messageStore.MaxMessageTimestamp(chatJID, ids); err != nil {
+					logger.Warnf("Failed to look up read receipt message times for %s: %v", chatJID, err)
+				} else if ok {
+					readAt = ts
+				}
+				if err := messageStore.MarkChatRead(chatJID, readAt); err != nil {
+					logger.Warnf("Failed to mark chat %s read: %v", chatJID, err)
+				}
+			}
 
 		case *events.GroupInfo:
 			if v.Ephemeral != nil {
@@ -3089,6 +3379,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			timestamp := time.Unix(int64(ts), 0)
 
 			_ = messageStore.StoreChat(chatJID, name, timestamp)
+			// Backfill read state only when WhatsApp explicitly reports unread
+			// metadata. Sparse history-sync chunks omit UnreadCount; the
+			// generated getter then returns 0 and would permanently mark the
+			// chat read under the monotonic merge.
+			if conversation.UnreadCount != nil &&
+				conversation.GetUnreadCount() == 0 &&
+				!conversation.GetMarkedAsUnread() {
+				if err := messageStore.MarkChatRead(chatJID, timestamp); err != nil {
+					logger.Warnf("Failed to backfill read state for %s: %v", chatJID, err)
+				}
+			}
 			if err := messageStore.UpdateChatEphemeralSettings(
 				chatJID,
 				conversation.GetEphemeralExpiration(),

@@ -22,6 +22,7 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - **Message Management**: Search and read personal WhatsApp messages (text, images, videos, documents, audio)
 - **Contact Search**: Search contacts by name or phone number with `sender_display` format ("Name (phone)")
 - **Send Messages**: Send text messages to individuals or groups
+- **Read Receipts**: Explicitly mark selected messages as read across linked devices
 - **Media Support**: Send and download images, videos, documents, and voice messages
 - **Call History**: Capture incoming voice/video calls into a local SQLite table (live, 1:1 and group)
 - **Webhook Integration**: Forward incoming messages to external services
@@ -200,6 +201,24 @@ Inbound quoted replies are stored automatically. The `quoted_message_id` field i
 - "Message the team group saying 'Meeting at 3pm'"
 - "Reply to that message saying 'Sounds good'"
 
+#### `mark_messages_read`
+
+Mark one or more messages from the same chat and sender as read. This explicitly
+sends WhatsApp read receipts; reading or searching messages never does so
+automatically.
+
+**Parameters:**
+
+- `message_ids` (required): IDs of messages from the same chat and sender
+- `chat_jid` (required): JID of the chat containing the messages
+- `sender_jid` (required for groups): Full JID or bare phone number of the original message sender
+- `timestamp` (optional): RFC 3339 read timestamp; defaults to the current time
+
+**Natural Language Examples:**
+
+- "Mark those messages as read"
+- "Mark the last three messages from Alice in the team group as read"
+
 #### `send_reaction`
 
 Send (or remove) an emoji reaction to a message.
@@ -273,6 +292,42 @@ Download media from a received message.
 
 ### Chat Operations
 
+All chat tools (`list_chats`, `get_chat`, `get_direct_chat_by_contact`,
+`get_contact_chats`) return the same chat shape:
+
+```jsonc
+{
+  "jid": "1234567890@s.whatsapp.net",
+  "name": "Alice",
+  "is_group": false,
+  "last_message_time": "2024-01-15T10:30:00+00:00",
+  "last_message": "hello world",       // null when include_last_message=false
+  "last_sender": "1234567890",         // null when include_last_message=false
+  "last_is_from_me": false,
+  "last_read_time": "2024-01-15T09:00:00+00:00", // how far the chat is read
+  "unread": true                       // last message is inbound and unread
+}
+```
+
+#### Read state (`last_read_time` / `unread`)
+
+`last_read_time` is the bridge's read marker for the chat, fed by read
+receipts from your own devices and backfilled from history sync. `unread` is
+derived from it: true when the chat's last message is inbound and newer than
+the marker. This distinguishes a genuinely unread chat from one whose last
+message merely happens to be inbound but was already read on the phone.
+
+Caveats:
+
+- **The marker only moves forward.** Marking an already-read chat as *unread*
+  again on the phone is not reflected.
+- **No marker means no read was ever reported** — for a chat with an inbound
+  last message, `unread` then falls back to the old heuristic and reports
+  true. Stores written by a bridge older than the `chats.last_read_time`
+  column report `last_read_time: null` and behave the same way.
+- **`unread` is a chat-level flag, not an unread count.** WhatsApp's unread
+  counter is not persisted.
+
 #### `list_chats`
 
 List all chats with metadata.
@@ -332,6 +387,7 @@ Copy `.env.example` to `.env` and configure as needed:
 | ---------------------- | ---------------------------------------- | -------------------------------------------- |
 | `WHATSAPP_BRIDGE_PORT` | `8080`                                   | Port for Go bridge REST API                  |
 | `WEBHOOK_URL`          | `http://localhost:8769/whatsapp/webhook` | Webhook for incoming messages                |
+| `WEBHOOK_ENABLED`      | `true`                                   | Set to `false` to disable outbound webhooks  |
 | `FORWARD_SELF`         | `true`                                   | Forward messages sent by self                |
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
@@ -609,6 +665,7 @@ flowchart LR
     subgraph GoAPI["Go Bridge REST API"]
         direction TB
         SEND["/api/send"]
+        READ["/api/mark-read"]
         DOWN["/api/download"]
         REACT["/api/react"]
         TYPE["/api/typing"]
@@ -616,7 +673,7 @@ flowchart LR
         HEALTH["/api/health"]
     end
 
-    subgraph MCPTools["MCP Tools (14 total)"]
+    subgraph MCPTools["MCP Tools (15 total)"]
         direction TB
         CONT["Contact Tools<br/>search_contacts, get_contact"]
         MSG["Message Tools<br/>list_messages, send_message, etc."]

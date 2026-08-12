@@ -35,6 +35,9 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
+    mark_messages_read as whatsapp_mark_messages_read,
+)
+from whatsapp import (
     msg_to_dict,
 )
 from whatsapp import (
@@ -225,6 +228,13 @@ def list_chats(
         page: Page number for pagination (default 0)
         include_last_message: Include the last message in each chat (default True)
         sort_by: "last_active" (default, most recent first) or "name" (alphabetical)
+
+    Returns:
+        Chat dictionaries with jid, name, is_group, last_message_time, last_message,
+        last_sender, last_is_from_me, last_read_time and unread. `last_read_time` is
+        how far the chat has been read on any device (null if never reported); `unread`
+        is true when the last message is inbound and newer than that marker, so chats
+        already read on the phone are not reported as unread.
     """
     # Cap limit at 200 to prevent excessive queries
     limit = min(limit, 200)
@@ -241,6 +251,9 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
     Args:
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
+
+    Returns:
+        Chat dictionary — same shape as list_chats, including last_read_time and unread.
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
     return chat
@@ -368,20 +381,51 @@ def send_reaction(
 
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
+def mark_messages_read(
+    message_ids: list[str],
+    chat_jid: str,
+    sender_jid: str = "",
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Mark selected WhatsApp messages as read and send read receipts.
+
+    This is an explicit external side effect. All message IDs must belong to the
+    same chat and sender.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
+        message_ids: IDs of the messages to mark as read
+        chat_jid: JID of the chat containing the messages
+        sender_jid: JID or bare phone number of the original sender; required for groups
+        timestamp: Optional RFC 3339 read timestamp; defaults to the current time
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_mark_messages_read(message_ids, chat_jid, sender_jid, timestamp)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, Any]:
+    """Send a file (image, video, document) via WhatsApp, optionally with a caption.
+
+    When `caption` is provided, the file and text arrive as a single
+    attachment-with-caption message (one bubble in the WA UI), instead of
+    needing a separate follow-up send_message call. For group chats use the JID.
+
+    Args:
+        recipient: Either a phone number with country code (no + or symbols),
+                 or a JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us")
+        media_path: Absolute path to the media file (image, video, document)
+        caption: Optional text rendered with the file as a caption. Omit for a
+                 bare attachment.
 
     Returns:
         A dictionary containing success status and a status message
     """
 
     # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    success, status_message = whatsapp_send_file(recipient, media_path, caption)
     return {"success": success, "message": status_message}
 
 
