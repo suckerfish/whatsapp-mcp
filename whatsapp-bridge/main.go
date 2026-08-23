@@ -3500,6 +3500,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					// Fetch the bytes too. StoreMessage only records the URL and
+					// media key; without this the file never lands on disk and the
+					// link expires out from under us.
+					queueHistoryMediaDownload(client, messageStore, msgID, chatJID, mediaType, logger)
 					// Log successful message storage
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
