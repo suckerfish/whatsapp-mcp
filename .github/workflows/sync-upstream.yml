@@ -8,17 +8,14 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # GITHUB_TOKEN cannot push commits that touch .github/workflows/.
-          # Those syncs are done manually — see the "Push if merged cleanly" step.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with Contents + Workflows write. GITHUB_TOKEN cannot push
+          # commits that touch .github/workflows/.
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure git
         run: |
@@ -43,24 +40,7 @@ jobs:
 
       - name: Push if merged cleanly
         if: steps.merge.outputs.merged == 'true'
-        run: |
-          if git push origin main 2>push.log; then
-            cat push.log
-            exit 0
-          fi
-          cat push.log
-          if grep -q "without \`workflows\` permission" push.log; then
-            {
-              echo "### Upstream sync needs a manual push"
-              echo "Upstream changed a file in \`.github/workflows/\`."
-              echo "\`GITHUB_TOKEN\` cannot push workflow changes. Sync locally:"
-              echo '```'
-              echo "git fetch upstream main && git merge upstream/main && git push origin main"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Push rejected: upstream changed workflow files — sync manually."
-          fi
-          exit 1
+        run: git push origin main
 
       - name: Report conflict
         if: steps.merge.outputs.merged == 'false'
