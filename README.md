@@ -38,6 +38,20 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - Claude Desktop or Cursor
 - FFmpeg (optional, for voice message conversion)
 
+**Intel macOS:** patched `cryptography` releases no longer provide Intel Mac
+wheels, so installation may compile this dependency from source. Install the
+Xcode Command Line Tools (`xcode-select --install`) and, with Homebrew,
+`brew install rust openssl@3 pkg-config`. Then install the Python dependencies:
+
+```bash
+cd whatsapp-mcp-server
+OPENSSL_DIR="$(brew --prefix openssl@3)" uv sync
+```
+
+Use a Rust toolchain supported by the installed `cryptography` release; see its
+[source-build instructions](https://cryptography.io/en/latest/installation/#building-cryptography-on-macos).
+Keep the patched dependency rather than restoring the old vulnerable version pin.
+
 ### Quick Start
 
 1. **Clone the repository**
@@ -774,6 +788,21 @@ Caveats:
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
 
+History sync preserves the same supported message text as live reception,
+including WhatsApp Business templates, button messages, and image/video/document
+captions. Shared contact cards are searchable text containing the display name
+and phone numbers; they do not require a media download. Live contact cards
+retain reply context and disappearing-message settings. Raw history envelopes
+are unwrapped using the same parser as live events. This applies to both
+active and archived chats. The fix does not
+retroactively restore text skipped by an older bridge: the affected messages
+must be delivered again through history sync, subject to the phone's limits.
+
+Chat activity timestamps follow the newest history message stored as supported
+text or media. Protocol-only entries do not advance chat activity. Their read
+and disappearing-message settings are retained, while metadata-only rows are
+excluded from chat listings until a message or reaction is stored.
+
 ### Requesting history for a single chat (on-demand)
 
 `--full-history-pair` only applies to a fresh pair, so recovering a gap in one
@@ -991,6 +1020,13 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Troubleshooting
 
+### Chat names show phone numbers
+
+The bridge retries name resolution when a stored chat name is a numeric
+placeholder. It also repairs DMs previously named after your own account number
+when another message or history-sync event reaches that chat. Real stored names
+are preserved.
+
 ### Authentication Issues
 
 - **Pairing fails with `Client outdated` or HTTP 405**: Update to the latest
@@ -1005,6 +1041,10 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
   build from 2026-09-15 or later; older ones never emit the rotated code.
 - **Device Limit Reached**: Remove a linked device from WhatsApp Settings > Linked Devices.
 - **No Messages Loading**: Initial sync can take several minutes for large chat histories.
+- **MCP tools fail with `WhatsApp messages database not found`**: The MCP
+  server opens `messages.db` read-only and refuses to create it. Start the
+  bridge once so it creates `whatsapp-bridge/store/messages.db`, or set
+  `WHATSAPP_DB_PATH` to wherever it lives.
 - **Out of Sync**: Back up `whatsapp-bridge/store`, then move
   `whatsapp-bridge/store/whatsapp.db` aside and re-authenticate. Keep
   `messages.db` unless you intentionally want to discard local message history.

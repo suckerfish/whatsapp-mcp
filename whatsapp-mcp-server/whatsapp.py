@@ -4,6 +4,7 @@ import os.path
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -23,6 +24,29 @@ WHATSMEOW_DB_PATH = os.getenv(
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
 
 _BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(WHATSMEOW_DB_PATH), ".bridge-token")
+
+
+def _connect_messages_db() -> sqlite3.Connection:
+    """Open messages.db read-only, refusing to invent it.
+
+    sqlite3.connect() silently creates an empty database when the path is
+    wrong, and every read path here maps sqlite3.Error to an empty result, so
+    a misconfigured WHATSAPP_DB_PATH (or a bridge that never ran) used to read
+    as "you have no messages" rather than a setup problem. FileNotFoundError is
+    not a sqlite3.Error, so it surfaces to the MCP client as a tool error with
+    an actionable message. SQLite's mode=ro prevents both database creation
+    and writes, even if the path disappears before the connection opens.
+    """
+    path = Path(MESSAGES_DB_PATH).resolve()
+    try:
+        return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"WhatsApp messages database not found at {MESSAGES_DB_PATH}. "
+                "Start the bridge once so it creates the store, or point WHATSAPP_DB_PATH at it."
+            ) from exc
+        raise
 
 
 def _read_bridge_token() -> str | None:
@@ -315,32 +339,79 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
             conn.close()
 
 
-def _display_chat_name(jid: str, name: str | None) -> str | None:
-    """Resolve a chat's display name, falling back to whatsmeow's contact store.
+def _is_placeholder_chat_name(jid: str, name: str | None) -> bool:
+    """Report whether a stored chat name is one of the bridge's own fallbacks.
 
-    ``chats.name`` in messages.db is a denormalized cache written when the
-    bridge first sees a chat, so it keeps whatever was known at that moment —
-    usually the bare phone number. Contacts synced from the phone afterwards
-    land in whatsapp.db and never backfill that column, which is why a chat can
-    display as "14085551234" while the address book knows it as "Jane Doe".
-
-    Only consult the contact store when the cached name is missing or is just
-    the number; a real name already in ``chats.name`` (including one the user
-    set) always wins, and the lookup is skipped entirely for groups.
+    When the bridge cannot resolve a display name it writes the bare numeric
+    user-part of the JID (or "Group <id>") into chats.name. Those are stand-ins,
+    not names anyone chose, so they may be replaced by anything better we find.
     """
-    if jid.endswith("@g.us"):
-        return name
+    if not name:
+        return True
+    bare = jid.split("@")[0]
+    return name == bare or name == f"Group {bare}"
 
-    cached = (name or "").strip()
-    if cached and not cached.lstrip("+").isdigit():
-        return name
 
-    return _resolve_name_from_whatsmeow(jid) or name
+def _display_chat_name(jid: str, stored_name: str | None) -> str | None:
+    """Return the best display name for a chat.
+
+    messages.db is the source of truth and is used as-is whenever it holds a
+    real name. Only when it holds a placeholder do we consult whatsmeow's
+    contact store, which is where names live after a contact sync — the same
+    lookup get_sender_name already does for message senders. The placeholder is
+    kept when nothing better exists.
+
+    The lookup opens its own short-lived connection, so it is deliberately
+    gated on the placeholder check rather than run for every row.
+    """
+    placeholder = _is_placeholder_chat_name(jid, stored_name)
+    wrong_self_name = not placeholder and _is_stored_self_name(jid, stored_name)
+    if not placeholder and not wrong_self_name:
+        return stored_name
+    fallback = jid.split("@")[0] if wrong_self_name else stored_name
+    return _resolve_name_from_whatsmeow(jid) or fallback
+
+
+def _is_stored_self_name(jid: str, name: str | None) -> bool:
+    """Recognize outgoing-first DM names cached as our own account number."""
+    user, _, server = jid.partition("@")
+    if server not in ("s.whatsapp.net", "lid") or not name or not name.isdecimal() or user == name:
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(Path(WHATSMEOW_DB_PATH).resolve().as_uri() + "?mode=ro", uri=True)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(whatsmeow_device)")}
+        fields = [field for field in ("jid", "lid") if field in columns]
+        own_jids = []
+        if fields:
+            own_jids = [
+                jid
+                for row in conn.execute("SELECT " + ", ".join(fields) + " FROM whatsmeow_device")
+                for jid in row
+                if jid
+            ]
+        if not own_jids:
+            # Compatibility with stores that predate the device identity table.
+            own_jids = [row[0] for row in conn.execute("SELECT DISTINCT our_jid FROM whatsmeow_contacts") if row[0]]
+        own_users = {jid.split("@")[0].split(":")[0].split(".")[0] for jid in own_jids}
+        peer = (_resolve_lid_to_phone(user) or user) if server == "lid" else user
+        named_user = _resolve_lid_to_phone(name) or name
+        return named_user in own_users and peer not in own_users
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _like_escape(value: str) -> str:
+    """Escape SQL LIKE wildcards so user input is matched literally (pair with ESCAPE '\\\\')."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # First try matching by exact JID
@@ -364,14 +435,16 @@ def get_sender_name(sender_jid: str) -> str:
             else:
                 phone_part = sender_jid
 
+            # Anchor on the user part so a short number cannot match a longer
+            # unrelated JID by substring (e.g. 5551234 inside 15551234567@...).
             cursor.execute(
                 """
                 SELECT name
                 FROM chats
-                WHERE jid LIKE ?
+                WHERE jid LIKE ? ESCAPE '\\'
                 LIMIT 1
             """,
-                (f"%{phone_part}%",),
+                (f"{_like_escape(phone_part)}@%",),
             )
 
             result = cursor.fetchone()
@@ -392,7 +465,9 @@ def get_sender_name(sender_jid: str) -> str:
 
         return sender_jid
 
-    except sqlite3.Error as e:
+    except (sqlite3.Error, FileNotFoundError) as e:
+        # Name enrichment must never break a result that was already read;
+        # the primary read tools surface a missing store loudly on their own.
         print(f"Database error while getting sender name: {e}")
         return sender_jid
     finally:
@@ -464,7 +539,7 @@ def list_messages(
         List of message dictionaries with id, timestamp, sender, content, etc.
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # Build base query
@@ -573,7 +648,7 @@ def list_messages(
 def get_message_context(message_id: str, before: int = 5, after: int = 5) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # Get the target message first
@@ -687,8 +762,21 @@ def list_chats(
         List of chat dictionaries with jid, name, is_group, last_message, etc.
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
+
+        names: dict[tuple[str, str | None], str | None] = {}
+
+        def name_for_chat(jid, stored_name):
+            key = (jid, stored_name)
+            if key not in names:
+                names[key] = _display_chat_name(jid, stored_name)
+            return names[key]
+
+        # Resolve before filtering/sorting/pagination, using the same cached
+        # value for the returned row. The default activity path stays bounded
+        # to the selected page when no name search is requested.
+        conn.create_function("resolved_chat_name", 2, name_for_chat)
 
         # The last message is always joined — is_from_me feeds the unread
         # flag — but its content is only selected when asked for. The columns
@@ -713,13 +801,19 @@ def list_chats(
         """
         ]
 
-        where_clauses = []
+        # Keep read/ephemeral state for unknown conversations, but do not list
+        # metadata-only rows as chats until content or a reaction is stored.
+        where_clauses = [
+            "(chats.last_message_time IS NOT NULL OR EXISTS "
+            "(SELECT 1 FROM messages activity WHERE activity.chat_jid = chats.jid))"
+        ]
         params = []
 
         if query:
             # instr() on the raw column matches Unicode; LOWER()+LIKE only covers ASCII.
             where_clauses.append(
-                "(instr(LOWER(chats.name), LOWER(?)) > 0 OR instr(chats.name, ?) > 0 OR chats.jid LIKE ?)"
+                "(instr(LOWER(resolved_chat_name(chats.jid, chats.name)), LOWER(?)) > 0 "
+                "OR instr(resolved_chat_name(chats.jid, chats.name), ?) > 0 OR chats.jid LIKE ?)"
             )
             params.extend([query, query, f"%{query}%"])
 
@@ -727,7 +821,9 @@ def list_chats(
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
         # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        order_by = (
+            "chats.last_message_time DESC" if sort_by == "last_active" else "resolved_chat_name(chats.jid, chats.name)"
+        )
         query_parts.append(f"ORDER BY {order_by}")
 
         # Add pagination
@@ -742,7 +838,7 @@ def list_chats(
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=_display_chat_name(chat_data[0], chat_data[1]),
+                name=name_for_chat(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -775,7 +871,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
 
     # 1) Search messages.db chats table (existing behavior)
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -843,7 +939,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         aliases = _sender_aliases(jid)
@@ -907,7 +1003,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
         Message dictionary or None if no messages found
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         aliases = _sender_aliases(jid)
@@ -965,7 +1061,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         Chat dictionary or None if not found
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         # See list_chats: the last message is always joined for is_from_me,
@@ -1016,7 +1112,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
 def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | None:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_messages_db()
         cursor = conn.cursor()
 
         cursor.execute(
@@ -1031,10 +1127,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
                 {_last_read_time_select(cursor, "c")}
             FROM chats c
             {_last_message_join("c", "m")}
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid LIKE ? ESCAPE '\\' AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """,
-            (f"%{sender_phone_number}%",),
+            (f"{_like_escape(sender_phone_number.split('@')[0])}@%",),
         )
 
         chat_data = cursor.fetchone()

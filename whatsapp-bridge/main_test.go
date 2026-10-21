@@ -666,6 +666,95 @@ func TestGetChatName_LocalContactFallbackMissingTableFallsBack(t *testing.T) {
 	}
 }
 
+func TestGetChatName_PlaceholderNameIsRefreshedFromContacts(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	// The chat was stored earlier with the bare number, which is what
+	// GetChatName falls back to when no contact is known yet.
+	if _, err := ms.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)`,
+		phonePN.String(), phonePN.User, time.Now(),
+	); err != nil {
+		t.Fatalf("seed chat: %v", err)
+	}
+
+	waDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open whatsmeow db: %v", err)
+	}
+	t.Cleanup(func() { _ = waDB.Close() })
+	ms.waDB = waDB
+
+	// Meanwhile the contact turned up in whatsmeow's store — e.g. the contact
+	// sync that runs after a re-pair.
+	if _, err := waDB.Exec(`
+		CREATE TABLE whatsmeow_contacts (
+			our_jid TEXT,
+			their_jid TEXT,
+			first_name TEXT,
+			full_name TEXT,
+			push_name TEXT,
+			business_name TEXT,
+			PRIMARY KEY (our_jid, their_jid)
+		);
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, push_name, business_name)
+			VALUES (?, ?, '', 'Real Name', '', '');
+	`, selfPhone.String(), phonePN.String()); err != nil {
+		t.Fatalf("seed whatsmeow contacts: %v", err)
+	}
+
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, "", logger)
+	if got != "Real Name" {
+		t.Fatalf("GetChatName() = %q, want the resolved contact name to replace the numeric placeholder", got)
+	}
+}
+
+func TestGetChatName_RealStoredNameIsKept(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	if _, err := ms.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)`,
+		phonePN.String(), "Nickname I Chose", time.Now(),
+	); err != nil {
+		t.Fatalf("seed chat: %v", err)
+	}
+
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, "Sender Fallback", logger)
+	if got != "Nickname I Chose" {
+		t.Fatalf("GetChatName() = %q, want the stored name to be preserved", got)
+	}
+}
+
+func TestIsPlaceholderChatName(t *testing.T) {
+	group := types.JID{User: "123456789", Server: types.GroupServer}
+
+	cases := []struct {
+		name string
+		in   string
+		jid  types.JID
+		want bool
+	}{
+		{"empty", "", phonePN, true},
+		{"bare number", phonePN.User, phonePN, true},
+		{"group fallback", "Group 123456789", group, true},
+		{"real name", "Alice", phonePN, false},
+		{"other number", "31600000000", phonePN, false},
+		{"group with real name", "Family", group, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPlaceholderChatName(tc.in, tc.jid); got != tc.want {
+				t.Fatalf("isPlaceholderChatName(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // --- Integration tests: handleMessage stores under correct JID ---
 
 func TestHandleMessage_IncomingLIDMessage_StoredUnderPhoneJID(t *testing.T) {
@@ -1083,6 +1172,121 @@ func TestHandleHistorySync_LIDParticipant_ResolvedViaStore(t *testing.T) {
 	}
 }
 
+// TestHandleHistorySync_GroupSenderFromTopLevelParticipant pins the sender
+// source for history-synced group messages: modern history syncs carry the
+// sender in the top-level WebMessageInfo.participant field while
+// Key.Participant is empty. The sender column must hold that participant,
+// not the group JID fallback.
+func TestHandleHistorySync_GroupSenderFromTopLevelParticipant(t *testing.T) {
+	groupJID := types.JID{User: "120363000000000001", Server: types.GroupServer}
+	participant := types.JID{User: "31612345678", Server: types.DefaultUserServer}
+
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID:   proto.String(groupJID.String()),
+					Name: proto.String("Test Group"),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-group-001"),
+									FromMe: proto.Bool(false),
+								},
+								Participant:      proto.String(participant.String()),
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									Conversation: proto.String("group history payload"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	got := querySender(ms, groupJID.String())
+	if got != participant.User {
+		t.Errorf("history-sync group sender = %q, want participant %q (group JID fallback was %q)",
+			got, participant.User, groupJID.User)
+	}
+}
+
+// TestHandleHistorySync_DMSenderIgnoresParticipant guards the other side of
+// the participant lookup: for one-to-one chats the sender is always the
+// remote chat itself, even if the history row carries a top-level or
+// Key-level Participant. Without this gate a DM row with Participant set
+// would be attributed to that participant instead of the chat peer, which
+// is the ordering whatsmeow's ParseWebMessage enforces.
+func TestHandleHistorySync_DMSenderIgnoresParticipant(t *testing.T) {
+	peer := types.JID{User: "31612345678", Server: types.DefaultUserServer}
+	peerLID := types.JID{User: "987654321000001", Server: types.HiddenUserServer}
+	stray := types.JID{User: "31699999999", Server: types.DefaultUserServer}
+
+	cases := []struct {
+		name    string
+		chatJID types.JID
+		wantKey string // chat_jid the row is stored under
+	}{
+		{name: "phone DM", chatJID: peer, wantKey: peer.String()},
+		{name: "LID DM resolved via store", chatJID: peerLID, wantKey: peer.String()},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newTestClientWithSelf(&mockLIDStore{
+				pnByLID: map[types.JID]types.JID{peerLID: peer},
+			}, selfPhone)
+			ms := newTestMessageStore(t)
+			logger := testLogger()
+
+			historySync := &events.HistorySync{
+				Data: &waProto.HistorySync{
+					SyncType: waProto.HistorySync_RECENT.Enum(),
+					Conversations: []*waProto.Conversation{
+						{
+							ID: proto.String(tc.chatJID.String()),
+							Messages: []*waProto.HistorySyncMsg{
+								{
+									Message: &waProto.WebMessageInfo{
+										Key: &waCommon.MessageKey{
+											ID:          proto.String("hist-dm-001"),
+											FromMe:      proto.Bool(false),
+											Participant: proto.String(stray.String()),
+										},
+										Participant:      proto.String(stray.String()),
+										MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+										Message: &waProto.Message{
+											Conversation: proto.String("dm history payload"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			handleHistorySync(client, ms, historySync, logger)
+
+			got := querySender(ms, tc.wantKey)
+			if got != peer.User {
+				t.Errorf("history-sync DM sender = %q, want chat peer %q (stray participant was %q)",
+					got, peer.User, stray.User)
+			}
+		})
+	}
+}
+
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
@@ -1286,6 +1490,86 @@ func TestExtractTextContent_SurfacesMediaCaptions(t *testing.T) {
 		{
 			name: "ImageMessage without caption returns empty",
 			msg:  &waProto.Message{ImageMessage: &waProto.ImageMessage{}},
+			want: "",
+		},
+		{
+			name: "ContactMessage with phone number in vCard",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("John Doe"),
+					Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nN:;John Doe;;;\nFN:John Doe\n" +
+						"TEL;type=CELL;waid=6281234567890:+62 812-3456-7890\nEND:VCARD"),
+				},
+			},
+			want: "📇 John Doe (+62 812-3456-7890)",
+		},
+		{
+			name: "ContactMessage with iPhone-style grouped TEL property",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("Adie Taxi"),
+					Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nFN:Adie Taxi\n" +
+						"item1.TEL;waid=6281338417222:+62 813-3841-7222\nitem1.X-ABLabel:Mobil\nEND:VCARD"),
+				},
+			},
+			want: "📇 Adie Taxi (+62 813-3841-7222)",
+		},
+		{
+			name: "ContactMessage with multiple TEL lines keeps every number",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("John Doe"),
+					Vcard: proto.String("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:John Doe\r\n" +
+						"TEL;type=CELL:+62 812-3456-7890\r\nTEL;type=WORK:+47 22 33 44 55\r\nEND:VCARD"),
+				},
+			},
+			want: "📇 John Doe (+62 812-3456-7890, +47 22 33 44 55)",
+		},
+		{
+			name: "ContactMessage without a TEL line falls back to name only",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("Jane Doe"),
+					Vcard:       proto.String("BEGIN:VCARD\nVERSION:3.0\nFN:Jane Doe\nEND:VCARD"),
+				},
+			},
+			want: "📇 Jane Doe",
+		},
+		{
+			name: "ContactMessage with neither name nor TEL returns empty (no placeholder row)",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nEND:VCARD"),
+				},
+			},
+			want: "",
+		},
+		{
+			name: "ContactsArrayMessage with multiple shared contacts",
+			msg: &waProto.Message{
+				ContactsArrayMessage: &waProto.ContactsArrayMessage{
+					DisplayName: proto.String("2 contacts"),
+					Contacts: []*waProto.ContactMessage{
+						{
+							DisplayName: proto.String("John Doe"),
+							Vcard:       proto.String("BEGIN:VCARD\nTEL;waid=1:+1 111\nEND:VCARD"),
+						},
+						{
+							DisplayName: proto.String("Jane Doe"),
+							Vcard:       proto.String("BEGIN:VCARD\nFN:Jane Doe\nEND:VCARD"),
+						},
+					},
+				},
+			},
+			want: "📇 2 contacts shared: John Doe (+1 111); Jane Doe",
+		},
+		{
+			name: "ContactsArrayMessage with no contacts returns empty (no placeholder row)",
+			msg: &waProto.Message{
+				ContactsArrayMessage: &waProto.ContactsArrayMessage{
+					DisplayName: proto.String("0 contacts"),
+				},
+			},
 			want: "",
 		},
 		{
@@ -3269,5 +3553,49 @@ func TestRenderPairingQRCodes_Outcomes(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: outcome = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestGetChatName_SenderFallbackNeverUsesOwnNumber(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	// No contact known for the peer, and the triggering message was outgoing,
+	// so handleMessage passes our own user-part as sender.
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, selfPhone.User, logger)
+	if got == selfPhone.User {
+		t.Fatalf("GetChatName() = %q, want the peer JID rather than our own number", got)
+	}
+	if got != phonePN.User {
+		t.Fatalf("GetChatName() = %q, want %q", got, phonePN.User)
+	}
+}
+
+func TestGetChatName_SenderFallbackStillUsedForOtherSender(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, "Sender Fallback", logger)
+	if got != "Sender Fallback" {
+		t.Fatalf("GetChatName() = %q, want the sender fallback to be kept", got)
+	}
+}
+
+func TestIsSelfUser(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+
+	if !isSelfUser(client, selfPhone.User) {
+		t.Fatalf("isSelfUser(%q) = false, want true for our own phone user-part", selfPhone.User)
+	}
+	if isSelfUser(client, phonePN.User) {
+		t.Fatalf("isSelfUser(%q) = true, want false for a peer", phonePN.User)
+	}
+	if isSelfUser(client, "") {
+		t.Fatal("isSelfUser(\"\") = true, want false")
+	}
+	if isSelfUser(nil, selfPhone.User) {
+		t.Fatal("isSelfUser(nil, ...) = true, want false")
 	}
 }

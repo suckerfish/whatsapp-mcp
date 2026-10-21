@@ -730,6 +730,25 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// StoreChatName refreshes a chat's display name without touching
+// last_message_time. Events that are not content messages (reactions,
+// protocol messages, polls, contact cards) go through here: they may keep
+// the name fresh and must guarantee the chats row exists for the messages
+// foreign key, but they must not reorder the chat in list_chats or make it
+// look unread — WhatsApp itself neither bumps nor badges a chat for them.
+// A new row gets a NULL last_message_time, the same shape MarkChatRead and
+// UpdateChatEphemeralSettings already produce.
+func (store *MessageStore) StoreChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name)
+		VALUES (?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = CASE WHEN excluded.name = '' THEN chats.name ELSE excluded.name END`,
+		jid, name,
+	)
+	return err
+}
+
 // UpdateChatEphemeralSettings records the chat's disappearing-message timer.
 // Writes are gated on settingTimestamp so that low-information events don't
 // clobber authoritative ones:
@@ -1077,8 +1096,15 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Extract text content from a message
+// unwrapMessageContent normalizes raw history-sync envelopes using the same
+// whatsmeow parser used for live events. Already-unwrapped messages are unchanged.
+func unwrapMessageContent(msg *waProto.Message) *waProto.Message {
+	return (&events.Message{RawMessage: msg}).UnwrapRaw().Message
+}
+
+// Extract text content from a message.
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessageContent(msg)
 	if msg == nil {
 		return ""
 	}
@@ -1100,6 +1126,30 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		return doc.GetCaption()
+	}
+
+	// Shared contact cards (vCards) carry no URL/MediaKey — the vCard text is
+	// embedded directly in the message rather than fetched from the CDN — so
+	// without this branch extractMediaInfo also returns "" for them and the
+	// message is silently dropped at the "no content and no media" gate in
+	// handleMessage: shared contacts were vanishing entirely.
+	if contact := msg.GetContactMessage(); contact != nil {
+		if body := formatContactContent(contact.GetDisplayName(), contact.GetVcard()); body != "" {
+			return "📇 " + body
+		}
+	}
+	if contacts := msg.GetContactsArrayMessage(); contacts != nil {
+		if list := contacts.GetContacts(); len(list) > 0 {
+			names := make([]string, 0, len(list))
+			for _, c := range list {
+				if body := formatContactContent(c.GetDisplayName(), c.GetVcard()); body != "" {
+					names = append(names, body)
+				}
+			}
+			if len(names) > 0 {
+				return fmt.Sprintf("📇 %d contacts shared: %s", len(names), strings.Join(names, "; "))
+			}
+		}
 	}
 
 	// WhatsApp Business templates arrive hydrated — body lives in
@@ -1145,6 +1195,52 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 
 	return ""
+}
+
+// formatContactContent renders a shared contact card as searchable text:
+// the display name plus every phone number in the vCard body. All numbers are
+// kept (not just the first) because the vCard is the only copy we ever get —
+// there is no CDN payload to re-download later. Returns "" when there is
+// nothing usable (no display name and no TEL line).
+func formatContactContent(displayName, vcard string) string {
+	phones := extractVCardPhones(vcard)
+	if displayName == "" && len(phones) == 0 {
+		return ""
+	}
+	if len(phones) > 0 {
+		return fmt.Sprintf("%s (%s)", displayName, strings.Join(phones, ", "))
+	}
+	return displayName
+}
+
+// extractVCardPhones returns the values of all TEL lines in a vCard blob,
+// e.g. "TEL;type=CELL;waid=6281234567890:+62 812-3456-7890" -> "+62 812-3456-7890".
+// iPhone-exported vCards wrap properties in groups ("item1.TEL;...:+62 ..."),
+// so the property name is compared after stripping any group prefix.
+func extractVCardPhones(vcard string) []string {
+	var phones []string
+	// vCard continuation lines remove the newline and one leading whitespace.
+	// Unfold before splitting properties so TEL values cannot be truncated.
+	vcard = strings.NewReplacer("\r\n ", "", "\r\n\t", "", "\n ", "", "\n\t", "").Replace(vcard)
+	for _, line := range strings.Split(vcard, "\n") {
+		line = strings.TrimSpace(line)
+		prop := line
+		if i := strings.IndexAny(prop, ";:"); i != -1 {
+			prop = prop[:i]
+		}
+		if dot := strings.LastIndex(prop, "."); dot != -1 {
+			prop = prop[dot+1:]
+		}
+		if !strings.EqualFold(prop, "TEL") {
+			continue
+		}
+		if idx := strings.LastIndex(line, ":"); idx != -1 {
+			if phone := strings.TrimSpace(line[idx+1:]); phone != "" {
+				phones = append(phones, phone)
+			}
+		}
+	}
+	return phones
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -1298,6 +1394,10 @@ func extractChatEphemeralFromMessage(msg *waProto.Message) ChatEphemeralSettings
 		ctx = msg.DocumentMessage.GetContextInfo()
 	case msg.StickerMessage != nil:
 		ctx = msg.StickerMessage.GetContextInfo()
+	case msg.ContactMessage != nil:
+		ctx = msg.ContactMessage.GetContextInfo()
+	case msg.ContactsArrayMessage != nil:
+		ctx = msg.ContactsArrayMessage.GetContextInfo()
 	}
 	if ctx == nil {
 		return ChatEphemeralSettings{}
@@ -1690,6 +1790,10 @@ func extractQuotedMessageInfo(msg *waProto.Message) (quotedMessageId string, quo
 		contextInfo = doc.GetContextInfo()
 	} else if aud := msg.GetAudioMessage(); aud != nil {
 		contextInfo = aud.GetContextInfo()
+	} else if contact := msg.GetContactMessage(); contact != nil {
+		contextInfo = contact.GetContextInfo()
+	} else if contacts := msg.GetContactsArrayMessage(); contacts != nil {
+		contextInfo = contacts.GetContextInfo()
 	}
 
 	if contextInfo == nil {
@@ -1731,6 +1835,10 @@ func extractMentionedJIDs(msg *waProto.Message) []string {
 		contextInfo = doc.GetContextInfo()
 	} else if aud := msg.GetAudioMessage(); aud != nil {
 		contextInfo = aud.GetContextInfo()
+	} else if contact := msg.GetContactMessage(); contact != nil {
+		contextInfo = contact.GetContextInfo()
+	} else if contacts := msg.GetContactsArrayMessage(); contacts != nil {
+		contextInfo = contacts.GetContextInfo()
 	}
 
 	if contextInfo == nil || len(contextInfo.MentionedJID) == 0 {
@@ -1743,6 +1851,7 @@ func extractMentionedJIDs(msg *waProto.Message) []string {
 // Extract media info from a message. Filenames embed the message ID so that
 // two messages arriving in the same second do not collide on a single file.
 func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	msg = unwrapMessageContent(msg)
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
@@ -1968,12 +2077,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msgTimestamp = orig
 	}
 
-	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msgTimestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
-	}
-
+	// last_message_time is advanced only when a message row is actually stored
+	// (see StoreChat below). Bumping it here for every stanza let reactions
+	// and protocol messages float a chat to the top of list_chats — and, for
+	// inbound reactions, flag it unread — without any new message to show.
 	updateChatEphemeralSettingsFromProtocolMessage(messageStore, chatJID, msg.Message, msg.Info.Timestamp.Unix(), logger)
 	handleMessageRevoke(messageStore, msg.Message, chatJID, msg.Info.Timestamp.Unix(), logger)
 
@@ -2005,6 +2112,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 		if reactedToID != "" {
 			emoji := reaction.GetText()
+			if err := messageStore.StoreChatName(chatJID, name); err != nil {
+				logger.Warnf("Failed to store chat for reaction: %v", err)
+			}
 			if err := messageStore.StoreMessage(
 				msg.Info.ID, chatJID, sender, emoji,
 				msgTimestamp, msg.Info.IsFromMe,
@@ -2036,8 +2146,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
-	// Store message in database first so that downloadMedia (which queries the DB
-	// by message ID) can find the row when we call it synchronously below.
+	// Advance the chat's last_message_time now that we know a message row will
+	// be written, then store the message first so that downloadMedia (which
+	// queries the DB by message ID) can find the row when called synchronously.
+	err := messageStore.StoreChat(chatJID, name, msgTimestamp)
+	if err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
+	}
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
@@ -3174,7 +3289,7 @@ func main() {
 			if connErr != nil {
 				logger.Errorf("Failed to get QR channel: %v", connErr)
 				if attempt == maxRetries {
-					return
+					os.Exit(1)
 				}
 				time.Sleep(5 * time.Second)
 				continue
@@ -3184,7 +3299,7 @@ func main() {
 			if connErr != nil {
 				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
 				if attempt == maxRetries {
-					return
+					os.Exit(1)
 				}
 				time.Sleep(5 * time.Second)
 				continue
@@ -3210,7 +3325,7 @@ func main() {
 				logger.Errorf("Timeout waiting for QR code scan (attempt %d)", attempt)
 				client.Disconnect()
 				if attempt == maxRetries {
-					return
+					os.Exit(1)
 				}
 				time.Sleep(10 * time.Second)
 				continue
@@ -3221,7 +3336,7 @@ func main() {
 			if connErr != nil {
 				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
 				if attempt == maxRetries {
-					return
+					os.Exit(1)
 				}
 				time.Sleep(5 * time.Second)
 				continue
@@ -3238,7 +3353,7 @@ connectionSuccess:
 
 	if !client.IsConnected() {
 		logger.Errorf("Failed to establish stable connection")
-		return
+		os.Exit(1)
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
@@ -3315,12 +3430,52 @@ connectionSuccess:
 	client.Disconnect()
 }
 
+// isPlaceholderChatName reports whether name is one of the fallbacks GetChatName
+// stores when no real display name could be resolved: the bare numeric user-part
+// of the JID, or "Group <id>" for groups. Such a value must not be treated as a
+// resolved name, otherwise it can never be upgraded once a better one exists.
+func isPlaceholderChatName(name string, jid types.JID) bool {
+	if name == "" {
+		return true
+	}
+	return name == jid.User || name == fmt.Sprintf("Group %s", jid.User)
+}
+
+// isSelfUser reports whether user is the user-part of our own account, in
+// either its phone or its LID form. Used to keep our own identity out of
+// peer-facing display names.
+func isSelfUser(client *whatsmeow.Client, user string) bool {
+	if user == "" || client == nil || client.Store == nil {
+		return false
+	}
+	if client.Store.ID != nil && user == client.Store.ID.ToNonAD().User {
+		return true
+	}
+	if !client.Store.LID.IsEmpty() && user == client.Store.LID.ToNonAD().User {
+		return true
+	}
+	return false
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real name.
+	//
+	// A stored name that is merely the numeric JID user-part (or "Group <id>")
+	// is one of the fallbacks further down this function, not a name anyone
+	// chose. Returning it here would make that fallback permanent: the first
+	// message from an unknown peer pins the number, and the chat keeps it even
+	// after the contact shows up in whatsmeow's store — which is exactly what
+	// happens after a re-pair, when the contact sync repopulates
+	// whatsmeow_contacts but nothing ever re-reads it. Treat those as "no name
+	// yet" and fall through to resolution instead.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	// Older bridges also cached our own number as the name of outgoing-first
+	// DMs. Repair those on the next event, while preserving actual self chats.
+	badSelfName := (jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer) &&
+		!isSelfUser(client, jid.User) && isSelfUser(client, existingName)
+	if err == nil && existingName != "" && !isPlaceholderChatName(existingName, jid) && !badSelfName {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -3388,7 +3543,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			name = lookupLocalContactName(client, messageStore, chatJID, logger)
 
 			if name == "" {
-				if sender != "" {
+				if sender != "" && !isSelfUser(client, sender) {
 					name = sender
 				} else {
 					name = jid.User
@@ -3487,6 +3642,44 @@ func handleCallOffer(client *whatsmeow.Client, messageStore *MessageStore, meta 
 		kind, direction, meta.CallID, callType, fromJID, chatJID)
 }
 
+// historyMessageIsStorable mirrors the skip rule in handleHistorySync's store
+// loop: text supported by the shared parser or media produces a
+// messages row, so anything else must not influence chat ordering.
+func historyMessageIsStorable(msg *waProto.HistorySyncMsg) bool {
+	if msg == nil || msg.Message == nil || msg.Message.Message == nil {
+		return false
+	}
+	m := msg.Message.Message
+	if extractTextContent(m) != "" {
+		return true
+	}
+	mediaType, _, _, _, _, _, _ := extractMediaInfo(m, time.Time{}, "")
+	return mediaType != ""
+}
+
+// newestStorableHistoryTimestamp returns the timestamp of the newest message in
+// a history-sync conversation that will actually be stored, and false when
+// none will. It is the history-sync twin of the live-message rule in
+// handleMessage: chats.last_message_time only moves for a stored row.
+func newestStorableHistoryTimestamp(messages []*waProto.HistorySyncMsg) (time.Time, bool) {
+	var newest time.Time
+	found := false
+	for _, msg := range messages {
+		if !historyMessageIsStorable(msg) {
+			continue
+		}
+		ts := msg.Message.GetMessageTimestamp()
+		if ts == 0 {
+			continue
+		}
+		t := time.Unix(int64(ts), 0)
+		if !found || t.After(newest) {
+			newest, found = t, true
+		}
+	}
+	return newest, found
+}
+
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	// Log every history sync event with its shape. Different sync types
 	// carry different payloads; logging type/chunk/progress makes it easy
@@ -3539,7 +3732,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			}
 			timestamp := time.Unix(int64(ts), 0)
 
-			_ = messageStore.StoreChat(chatJID, name, timestamp)
+			// Advance last_message_time only to the newest message that will
+			// actually be stored. The conversation's first entry is often a
+			// protocol message (revoke, ephemeral-setting change) that the
+			// store loop below skips; using its timestamp floated the chat to
+			// the top of list_chats with no row behind it.
+			if newest, ok := newestStorableHistoryTimestamp(messages); ok {
+				_ = messageStore.StoreChat(chatJID, name, newest)
+			}
 			// Backfill read state only when WhatsApp explicitly reports unread
 			// metadata. Sparse history-sync chunks omit UnreadCount; the
 			// generated getter then returns 0 and would permanently mark the
@@ -3565,15 +3765,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Preserve the same searchable text as the live-message path,
+				// including Business templates and media captions.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info - pass message timestamp + ID for unique filenames
 				var mediaType, filename, url string
@@ -3600,21 +3794,34 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Determine sender. History-sync rows do not carry SenderAlt,
 				// so any LID-based participant is resolved through the
 				// whatsmeow LID store (populated during live message handling).
+				// Group senders live in the top-level WebMessageInfo.participant
+				// field on modern history syncs; Key.Participant is only a legacy
+				// fallback. Participant is only consulted for group/broadcast
+				// chats — for one-to-one (phone or LID) and newsletter chats
+				// the sender is the chat itself. Same order and gating as
+				// whatsmeow's ParseWebMessage.
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
+					var participant string
+					if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer && jid.Server != types.NewsletterServer {
+						participant = msg.Message.GetParticipant()
+						if participant == "" {
+							participant = msg.Message.Key.GetParticipant()
+						}
+					}
 					var rawSender types.JID
 					switch {
 					case isFromMe && client.Store.ID != nil:
 						rawSender = client.Store.ID.ToNonAD()
-					case msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
-						if parsed, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
+					case participant != "":
+						if parsed, perr := types.ParseJID(participant); perr == nil {
 							rawSender = parsed
 						} else {
-							rawSender = types.JID{User: *msg.Message.Key.Participant}
+							rawSender = types.JID{User: participant}
 						}
 					default:
 						rawSender = jid
