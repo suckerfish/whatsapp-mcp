@@ -83,6 +83,10 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 	if err != nil {
 		t.Fatalf("failed to open in-memory db: %v", err)
 	}
+	// Each pooled connection to ":memory:" is a separate, empty database.
+	// Background workers (e.g. history media downloads) can hold a connection
+	// while the test queries, so pin the pool to one shared connection.
+	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`
 		CREATE TABLE chats (
 			jid TEXT PRIMARY KEY,
