@@ -5,6 +5,13 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
+env:
+  ISSUE_TITLE: Upstream sync conflict
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -35,25 +42,82 @@ jobs:
             echo "merged=true" >> "$GITHUB_OUTPUT"
           else
             echo "merged=false" >> "$GITHUB_OUTPUT"
+            # Capture details before the abort clears the conflict state.
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
             git merge --abort
+            git log --oneline HEAD..upstream/main > "$RUNNER_TEMP/pending.txt"
           fi
 
       - name: Push if merged cleanly
         if: steps.merge.outputs.merged == 'true'
         run: git push origin main
 
+      - name: Close open conflict issue
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" |
+          while read -r num; do
+            gh issue close "$num" --comment "Upstream merged cleanly in $run_url."
+          done
+
       - name: Report conflict
         if: steps.merge.outputs.merged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fence='```'
+          resolve=$(printf '%s\n' "$fence" "git fetch upstream main" "git merge upstream/main" \
+            "# fix conflicts" "git push origin main" "$fence")
+          conflicts=$(sed "s/^\(.*\)$/- \`\1\`/" "$RUNNER_TEMP/conflicts.txt")
+
           {
             echo "### Upstream sync conflict"
+            echo "Conflicting files:"
+            echo "$conflicts"
+            echo
             echo "Resolve manually:"
-            echo '```'
-            echo "git fetch upstream main"
-            echo "git merge upstream/main"
-            echo "# fix conflicts"
-            echo "git push origin main"
-            echo '```'
+            echo "$resolve"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          existing=$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" \
+            --json number,title --jq "[.[] | select(.title == \"$ISSUE_TITLE\")][0].number // empty")
+
+          if [ -n "$existing" ]; then
+            {
+              echo "Sync still conflicts: $run_url"
+              echo
+              echo "Conflicting files:"
+              echo "$conflicts"
+            } > "$RUNNER_TEMP/comment.md"
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/comment.md"
+          else
+            {
+              echo "The daily sync from \`verygoodplugins/whatsapp-mcp\` hit a merge conflict."
+              echo
+              echo "Run: $run_url"
+              echo
+              echo "## Conflicting files"
+              echo "$conflicts"
+              echo
+              echo "## Upstream commits not yet merged"
+              echo '```'
+              cat "$RUNNER_TEMP/pending.txt"
+              echo '```'
+              echo
+              echo "## Resolve manually"
+              echo "$resolve"
+              echo
+              echo "The next clean sync closes this issue."
+            } > "$RUNNER_TEMP/issue.md"
+            gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/issue.md"
+          fi
+
           echo "::error::Upstream sync hit a merge conflict — manual resolution needed."
           exit 1

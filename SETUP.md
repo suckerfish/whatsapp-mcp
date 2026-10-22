@@ -120,4 +120,4 @@ Or use the Compose plugin's "Pull and recreate" button.
 
 ## Upstream sync
 
-A GitHub Actions workflow runs daily at 06:00 UTC to merge changes from `verygoodplugins/whatsapp-mcp` into this fork. If a merge conflict occurs, a GitHub issue is automatically opened so you can resolve it manually.
+A GitHub Actions workflow runs daily at 06:00 UTC to merge changes from `verygoodplugins/whatsapp-mcp` into this fork. On a merge conflict, the run fails and opens an issue titled "Upstream sync conflict". The issue lists the conflicting files, the upstream commits not yet merged, a link to the run, and the commands to resolve it manually. If that issue is already open, later conflicting runs add a comment with the new run link and the current conflicting files instead of opening a duplicate. The next clean merge closes the issue with a comment that links the successful run.
